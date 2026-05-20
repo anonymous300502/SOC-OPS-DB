@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { ChevronRight, Shield, Lock, Plus, Edit2, Trash2, Eye, BarChart3, Download, Upload } from 'lucide-react';
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
 import 'reactflow/dist/style.css';
+import SoarFlowViewer from './src/components/SoarFlowViewer';
 
 // ============================================================================
 // API SERVICE LAYER
@@ -125,6 +126,62 @@ class APIService {
     });
     if (!response.ok) throw new Error(`Failed to import ${type}`);
     return await response.json();
+  }
+
+  async importCorrelationRulesCSV(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await this.request(`${API_BASE}/import/correlation-rules/csv`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+      body: formData,
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to import CSV');
+    }
+    return await response.json();
+  }
+
+  async exportCorrelationRulesCSV() {
+    const response = await this.request(`${API_BASE}/export/correlation-rules/csv`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+    });
+    if (!response.ok) throw new Error('Failed to export CSV');
+    return await response.blob();
+  }
+
+  async importParsersText(modelId, file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await this.request(`${API_BASE}/import/parsers/text?model_id=${modelId}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+      body: formData,
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to import parsers text file');
+    }
+    return await response.json();
+  }
+
+  async exportParsersText(modelId) {
+    const response = await this.request(`${API_BASE}/export/parsers/text/${modelId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+    });
+    if (!response.ok) throw new Error('Failed to export parsers');
+    return await response.blob();
   }
 
   async createHighlight(modelId, data) {
@@ -440,106 +497,6 @@ function ModelListing({ framework, vectorId, vectorName, onSelectModel, onBack }
   );
 }
 
-// SOAR FLOW VISUALIZER
-function SoarFlowViewer({ flow }) {
-  const [nodes, setNodes] = useState([]);
-  const [edges, setEdges] = useState([]);
-
-  useEffect(() => {
-    if (!flow || !flow.workflow_json) return;
-    
-    // Check if it's the complex format with playbook_constructor
-    if (flow.workflow_json.playbook_constructor) {
-      try {
-        const constructorStr = typeof flow.workflow_json.playbook_constructor === 'string' 
-          ? flow.workflow_json.playbook_constructor 
-          : JSON.stringify(flow.workflow_json.playbook_constructor);
-        const constructor = JSON.parse(constructorStr);
-        
-        const newNodes = [];
-        const newEdges = [];
-        
-        if (constructor.operators) {
-          Object.entries(constructor.operators).forEach(([key, op]) => {
-            newNodes.push({
-              id: key,
-              position: { x: op.left || 0, y: op.top || 0 },
-              data: { 
-                label: (
-                  <div className="text-center" style={{ minWidth: '120px' }}>
-                    <div className="font-bold text-sm">{op.properties?.title || op.title}</div>
-                    {op.taskDetails && Object.keys(op.taskDetails).length > 0 && (
-                       <div className="text-xs text-blue-300 mt-1" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                         {JSON.stringify(op.taskDetails).slice(0, 50)}
-                         {JSON.stringify(op.taskDetails).length > 50 ? '...' : ''}
-                       </div>
-                    )}
-                  </div>
-                )
-              },
-              style: { background: '#1e293b', color: '#fff', border: '1px solid #3b82f6', borderRadius: '8px', padding: '10px' }
-            });
-          });
-        }
-        
-        if (constructor.links) {
-          Object.entries(constructor.links).forEach(([key, link]) => {
-            newEdges.push({
-              id: `edge-${key}`,
-              source: link.fromOperator,
-              target: link.toOperator,
-              animated: true,
-              label: link.fromConnector !== 'default' ? link.fromConnector : '',
-              style: { stroke: '#3b82f6' },
-              labelStyle: { fill: '#cbd5e1', fontWeight: 700 }
-            });
-          });
-        }
-        
-        setNodes(newNodes);
-        setEdges(newEdges);
-        return;
-      } catch (e) {
-        console.error("Failed to parse playbook_constructor", e);
-      }
-    }
-    
-    // Fallback to simple steps array
-    if (flow.workflow_json.steps) {
-      const steps = flow.workflow_json.steps;
-      const newNodes = steps.map((step, index) => ({
-        id: `node-${index}`,
-        type: 'default',
-        position: { x: 250, y: index * 100 },
-        data: { label: `${step.action} ${step.params ? JSON.stringify(step.params) : ''}` },
-        style: { background: '#1e293b', color: '#fff', border: '1px solid #3b82f6', borderRadius: '8px', padding: '10px' }
-      }));
-      
-      const newEdges = [];
-      for (let i = 0; i < steps.length - 1; i++) {
-        newEdges.push({
-          id: `edge-${i}-${i + 1}`,
-          source: `node-${i}`,
-          target: `node-${i + 1}`,
-          animated: true,
-          style: { stroke: '#3b82f6' }
-        });
-      }
-      setNodes(newNodes);
-      setEdges(newEdges);
-    }
-  }, [flow]);
-
-  return (
-    <div style={{ height: '300px', width: '100%', background: '#0f172a', borderRadius: '8px' }}>
-      <ReactFlow nodes={nodes} edges={edges} fitView>
-        <Background color="#334155" gap={16} />
-        <Controls />
-      </ReactFlow>
-    </div>
-  );
-}
-
 // MODEL DETAIL VIEW WITH TABS
 function ModelDetail({ modelId, modelName, onBack, userRole }) {
   const [details, setDetails] = useState(null);
@@ -560,19 +517,34 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
     }
   };
 
+  const [toasts, setToasts] = useState([]);
+
+  const showToast = useCallback((message, type = 'success', duration = 5000) => {
+    const id = Date.now() + Math.random().toString(36).substr(2, 9);
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, duration);
+  }, []);
+
   const handleExport = (type) => {
     let data;
     if (type === 'correlation-rules') data = details.correlation_rules;
     if (type === 'parsers') data = details.parsers;
     if (type === 'soar-flows') data = details.soar_flows;
     
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${type}_export.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${type}_export.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('JSON export completed!', 'success');
+    } catch (err) {
+      showToast(`JSON export failed: ${err.message}`, 'error');
+    }
   };
 
   const handleImport = async (type, event) => {
@@ -583,13 +555,93 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
       try {
         const data = JSON.parse(e.target.result);
         await api.importData(type, modelId, data);
-        alert('Import successful!');
+        showToast('JSON import successful!', 'success');
         await refreshDetails();
       } catch (err) {
-        alert(`Import failed: ${err.message}`);
+        showToast(`JSON import failed: ${err.message}`, 'error');
       }
     };
     reader.readAsText(file);
+  };
+
+  const handleExportCSV = async () => {
+    try {
+      const blob = await api.exportCorrelationRulesCSV();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `correlation_rules_export.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('Correlation rules exported successfully!', 'success');
+    } catch (err) {
+      showToast(`Export failed: ${err.message}`, 'error');
+    }
+  };
+
+  const handleImportCSV = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+      const res = await api.importCorrelationRulesCSV(file);
+      const { successful_inserts, failed_rows } = res;
+      const failedCount = failed_rows?.length || 0;
+      
+      if (failedCount > 0) {
+        showToast(
+          `Import complete: ${successful_inserts} rules successfully imported, ${failedCount} rows failed.`, 
+          'warning'
+        );
+      } else {
+        showToast(
+          `Import complete: ${successful_inserts} rules successfully imported!`, 
+          'success'
+        );
+      }
+      await refreshDetails();
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
+  };
+
+  const handleExportParserText = async () => {
+    try {
+      const blob = await api.exportParsersText(modelId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `parsers_export_${modelId}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('Parsers exported successfully!', 'success');
+    } catch (err) {
+      showToast(`Export failed: ${err.message}`, 'error');
+    }
+  };
+
+  const handleImportParserText = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+      const res = await api.importParsersText(modelId, file);
+      const { successful_inserts, failed_rows } = res;
+      const failedCount = failed_rows?.length || 0;
+      
+      if (failedCount > 0) {
+        showToast(
+          `Import complete: ${successful_inserts} parsers successfully imported, ${failedCount} lines failed.`, 
+          'warning'
+        );
+      } else {
+        showToast(
+          `Import complete: ${successful_inserts} parsers successfully imported!`, 
+          'success'
+        );
+      }
+      await refreshDetails();
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
   };
 
   const handleCreateHighlight = async (e) => {
@@ -602,9 +654,10 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
       });
       setHighlightTitle('');
       setHighlightContent('');
+      showToast('Highlight created successfully!', 'success');
       await refreshDetails();
     } catch (err) {
-      alert(`Failed to create highlight: ${err.message}`);
+      showToast(`Failed to create highlight: ${err.message}`, 'error');
     }
   };
 
@@ -730,14 +783,26 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <button
                   onClick={() => handleExport('correlation-rules')}
                   className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm"
+                  title="Export to JSON"
                 >
-                  <Download className="w-4 h-4" /> Export
+                  <Download className="w-4 h-4" /> Export JSON
+                </button>
+                <button
+                  onClick={() => handleExportCSV()}
+                  className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm"
+                  title="Export to CSV"
+                >
+                  <Download className="w-4 h-4" /> Export CSV
                 </button>
                 {canEdit && (
                   <>
-                    <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer">
-                      <Upload className="w-4 h-4" /> Import
+                    <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer" title="Import from JSON">
+                      <Upload className="w-4 h-4" /> Import JSON
                       <input type="file" accept=".json" className="hidden" onChange={(e) => handleImport('correlation-rules', e)} />
+                    </label>
+                    <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer" title="Import from CSV/TXT">
+                      <Upload className="w-4 h-4" /> Import CSV
+                      <input type="file" accept=".csv,.txt" className="hidden" onChange={(e) => handleImportCSV(e)} />
                     </label>
                     <button
                       onClick={() => setShowCreateRule(!showCreateRule)}
@@ -791,14 +856,26 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <button
                   onClick={() => handleExport('parsers')}
                   className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm"
+                  title="Export to JSON"
                 >
-                  <Download className="w-4 h-4" /> Export
+                  <Download className="w-4 h-4" /> Export JSON
+                </button>
+                <button
+                  onClick={() => handleExportParserText()}
+                  className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm"
+                  title="Export to multi-format text file"
+                >
+                  <Download className="w-4 h-4" /> Export Text
                 </button>
                 {canEdit && (
                   <>
-                    <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer">
-                      <Upload className="w-4 h-4" /> Import
+                    <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer" title="Import from JSON">
+                      <Upload className="w-4 h-4" /> Import JSON
                       <input type="file" accept=".json" className="hidden" onChange={(e) => handleImport('parsers', e)} />
+                    </label>
+                    <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer" title="Import from multi-format text file">
+                      <Upload className="w-4 h-4" /> Import Text
+                      <input type="file" accept=".txt" className="hidden" onChange={(e) => handleImportParserText(e)} />
                     </label>
                     <button
                       onClick={() => setShowCreateParser(!showCreateParser)}
@@ -866,7 +943,11 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <div key={flow.id} className="p-4 bg-slate-700/50 rounded border border-slate-600">
                   <h4 className="font-semibold text-white mb-2">{flow.name}</h4>
                   <p className="text-sm text-gray-400 mb-4">{flow.description}</p>
-                  <SoarFlowViewer flow={flow} />
+                  <SoarFlowViewer 
+                    playbook_constructor={flow.workflow_json?.playbook_constructor} 
+                    playbook_details={flow.workflow_json?.playbook_details} 
+                    steps={flow.workflow_json?.steps} 
+                  />
                 </div>
               ))}
               {!details.soar_flows?.length && (
@@ -964,6 +1045,30 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
             </div>
           </div>
         )}
+      </div>
+
+      {/* Toast Notifications */}
+      <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full">
+        {toasts.map((toast) => (
+          <div
+            key={toast.id}
+            className={`p-4 rounded shadow-lg border backdrop-blur flex items-start justify-between gap-3 text-sm transition-all duration-300 ${
+              toast.type === 'error'
+                ? 'bg-red-950/90 border-red-500/50 text-red-200 shadow-red-900/10'
+                : toast.type === 'warning'
+                ? 'bg-amber-950/90 border-amber-500/50 text-amber-200 shadow-amber-900/10'
+                : 'bg-emerald-950/90 border-emerald-500/50 text-emerald-200 shadow-emerald-900/10'
+            }`}
+          >
+            <div className="flex-1">{toast.message}</div>
+            <button
+              onClick={() => setToasts((prev) => prev.filter((t) => t.id !== toast.id))}
+              className="text-gray-400 hover:text-white text-xs font-bold font-mono"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
       </div>
     </div>
   );

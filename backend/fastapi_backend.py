@@ -3,11 +3,12 @@ FastAPI Backend for Cybersecurity Intelligence Dashboard
 Implements JWT authentication, RBAC, and all core endpoints
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Any, Union
 from datetime import datetime, timedelta
 import jwt
 import bcrypt
@@ -15,6 +16,10 @@ from functools import wraps
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import and_, create_engine
 import os
+import csv
+import codecs
+import json
+import io
 
 # Import models
 from database_models import (
@@ -164,7 +169,7 @@ class ParserUpdate(BaseModel):
 
 class CorrelationRuleCreate(BaseModel):
     name: str
-    rule_logic: str
+    rule_logic: Any
     description: Optional[str] = None
     author: Optional[str] = None
     severity: Optional[str] = None
@@ -794,6 +799,265 @@ async def create_highlight(
     db.add(new_highlight)
     db.commit()
     return {"message": "Highlight created successfully"}
+
+@app.post("/import/correlation-rules/csv")
+async def import_correlation_rules_csv(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    filename = file.filename or ""
+    if not (filename.endswith(".csv") or filename.endswith(".txt")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File must be a .csv or .txt file"
+        )
+    
+    successful_inserts = 0
+    failed_rows = []
+    
+    try:
+        reader = csv.DictReader(codecs.iterdecode(file.file, 'utf-8'), delimiter='|')
+        line_num = 1
+        for row in reader:
+            line_num += 1
+            rule_name = row.get("Rule Name")
+            rule_desc = row.get("Rule Desc")
+            severity = row.get("Severity")
+            created_by = row.get("Created By")
+            rule_builder_str = row.get("rule_builder")
+            tactics = row.get("tactics", "")
+            
+            if not rule_name:
+                failed_rows.append({
+                    "line": line_num,
+                    "reason": "Missing required field: Rule Name"
+                })
+                continue
+                
+            if rule_builder_str:
+                try:
+                    rule_logic = json.loads(rule_builder_str)
+                except Exception:
+                    rule_logic = {"raw_query": rule_builder_str}
+            else:
+                rule_logic = {"raw_query": ""}
+                
+            tags = [t.strip() for t in tactics.split(",") if t.strip()] if tactics else []
+            
+            try:
+                rule = CorrelationRule(
+                    name=rule_name,
+                    description=rule_desc,
+                    rule_logic=rule_logic,
+                    author=created_by or current_user.get("username", "Unknown"),
+                    severity=severity.lower() if severity else "medium",
+                    tags=tags
+                )
+                db.add(rule)
+                db.flush()
+                successful_inserts += 1
+            except Exception as e:
+                db.rollback()
+                failed_rows.append({
+                    "line": line_num,
+                    "reason": f"Database insertion failed: {str(e)}"
+                })
+                
+        db.commit()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to parse CSV file: {str(e)}"
+        )
+        
+    return {
+        "successful_inserts": successful_inserts,
+        "failed_rows": failed_rows
+    }
+
+@app.get("/export/correlation-rules/csv")
+async def export_correlation_rules_csv(
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    rules = db.query(CorrelationRule).all()
+    output = io.StringIO()
+    headers = [
+        "RuleID", "Rule Name", "Rule", "Rule Desc", "Severity", "Schedule", 
+        "Alert Freq", "Weeks", "Status", "Organisations", "Scheduled From", 
+        "Scheduled To", "Created On", "Created By", "rule_builder", "rule_type", 
+        "rule_properties", "aggr_rule", "aggr_rule_builder", "user_org_group_id", 
+        "sub_technique", "tactics", "technique", "alert_keys", "Compliance"
+    ]
+    
+    writer = csv.writer(output, delimiter='|', quoting=csv.QUOTE_MINIMAL, lineterminator='\n')
+    writer.writerow(headers)
+    
+    for r in rules:
+        rule_builder_str = ""
+        if r.rule_logic:
+            if isinstance(r.rule_logic, (dict, list)):
+                rule_builder_str = json.dumps(r.rule_logic)
+            else:
+                rule_builder_str = str(r.rule_logic)
+                
+        tactics_str = ",".join(r.tags) if isinstance(r.tags, list) else ""
+        
+        row = [
+            r.id,
+            r.name or "",
+            r.description or "",
+            r.description or "",
+            (r.severity or "medium").capitalize(),
+            "0",
+            "24",
+            "",
+            "Enabled",
+            "2,3,4,5,6,7,8,9,10,15,17,18,19",
+            "0",
+            "0",
+            r.created_at.strftime("%d-%m-%Y %H:%M:%S") if r.created_at else "",
+            r.author or "1",
+            rule_builder_str,
+            "regular",
+            "",
+            "{}",
+            '{"condition":"and","rules":[]}',
+            "0",
+            "",
+            tactics_str,
+            "",
+            "null",
+            "[]"
+        ]
+        writer.writerow(row)
+        
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode('utf-8')),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=correlation_rules_export.csv",
+            "Content-Type": "text/csv"
+        }
+    )
+
+@app.post("/import/parsers/text")
+async def import_parsers_text(
+    model_id: int,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    model = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+        
+    successful_inserts = 0
+    failed_rows = []
+    
+    try:
+        content = await file.read()
+        lines = content.decode('utf-8').splitlines()
+        
+        line_num = 0
+        for line in lines:
+            line_num += 1
+            stripped = line.strip()
+            if not stripped:
+                continue
+                
+            parser_format = "kv"
+            parser_config = {}
+            
+            try:
+                if stripped.startswith("CEF:"):
+                    parser_format = "cef"
+                    parser_config = json.loads(stripped[4:])
+                elif stripped.startswith("JSON:"):
+                    parser_format = "json"
+                    parser_config = json.loads(stripped[5:])
+                elif stripped.startswith("XML:"):
+                    parser_format = "xml"
+                    parser_config = json.loads(stripped[4:])
+                elif stripped.startswith("<%"):
+                    parser_format = "syslog_grok"
+                    parser_config = {"pattern": stripped}
+                else:
+                    parser_format = "kv"
+                    parser_config = {"pattern": stripped}
+                    
+                new_parser = Parser(
+                    source_model_id=model_id,
+                    name=f"Imported Parser - {parser_format.upper()}",
+                    format=parser_format,
+                    parser_config=parser_config,
+                    description=f"Imported from multi-format text file (line {line_num})",
+                    is_active=True
+                )
+                db.add(new_parser)
+                db.flush()
+                successful_inserts += 1
+            except Exception as e:
+                db.rollback()
+                failed_rows.append({
+                    "line": line_num,
+                    "reason": f"Parsing/Insertion failed: {str(e)}"
+                })
+                
+        db.commit()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process text file: {str(e)}"
+        )
+        
+    return {
+        "successful_inserts": successful_inserts,
+        "failed_rows": failed_rows
+    }
+
+@app.get("/export/parsers/text/{model_id}")
+async def export_parsers_text(
+    model_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    model = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+        
+    parsers = db.query(Parser).filter(Parser.source_model_id == model_id).all()
+    
+    lines = []
+    for p in parsers:
+        fmt = p.format.lower() if p.format else "kv"
+        config = p.parser_config or {}
+        
+        if fmt == "cef":
+            lines.append(f"CEF:{json.dumps(config)}")
+        elif fmt == "json":
+            lines.append(f"JSON:{json.dumps(config)}")
+        elif fmt == "xml":
+            lines.append(f"XML:{json.dumps(config)}")
+        elif fmt == "syslog_grok":
+            pattern = config.get("pattern", "")
+            lines.append(pattern)
+        else:
+            pattern = config.get("pattern", "")
+            lines.append(pattern)
+            
+    export_content = "\n".join(lines) + "\n"
+    
+    return Response(
+        content=export_content,
+        media_type="text/plain",
+        headers={
+            "Content-Disposition": f"attachment; filename=parsers_export_{model_id}.txt",
+            "Content-Type": "text/plain"
+        }
+    )
 
 @app.post("/import/correlation-rules")
 async def import_correlation_rules(

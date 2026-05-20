@@ -11,8 +11,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import JSONB
 
 Base = declarative_base()
+
+# Use JSONB for Postgres and fallback to JSON for SQLite/other databases
+JSONB_type = JSONB().with_variant(JSON, "sqlite")
+
 
 # ============================================================================
 # ENUMS
@@ -200,7 +205,7 @@ class CorrelationRule(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(255), nullable=False, index=True)
     description = Column(Text)
-    rule_logic = Column(Text, nullable=False)  # JSON or expression
+    rule_logic = Column(JSONB_type, nullable=False)  # JSON or expression
     author = Column(String(255))
     severity = Column(String(50))  # critical, high, medium, low
     tags = Column(JSON)  # Array of tags for categorization
@@ -245,7 +250,7 @@ class Parser(Base):
     source_model_id = Column(Integer, ForeignKey('source_models.id'), nullable=False)
     name = Column(String(255), nullable=False)
     format = Column(String(20), nullable=False)  # kv, json, grok, csv, cef, xml
-    parser_config = Column(JSON, nullable=False)  # Format-specific configuration
+    parser_config = Column(JSONB_type, nullable=False)  # Format-specific configuration
     description = Column(Text)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
