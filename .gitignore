@@ -1,0 +1,18 @@
+# Node modules
+node_modules/
+
+# Python environment & cache
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# Databases & local sqlite
+*.db
+*.sqlite
+
+# OS files
+.DS_Store
+
+# Local configuration / secrets
+.env

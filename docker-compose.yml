@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: cybersec-db
+    environment:
+      POSTGRES_USER: cybersec
+      POSTGRES_PASSWORD: secure_password_change_me_in_production
+      POSTGRES_DB: cybersec_dashboard
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cybersec"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cybersec-network
+    restart: unless-stopped
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cybersec-api
+    environment:
+      DATABASE_URL: postgresql://cybersec:secure_password_change_me_in_production@postgres:5432/cybersec_dashboard
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 480
+      ALLOWED_ORIGINS: http://localhost,http://localhost:3000,https://yourdomain.com
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    networks:
+      - cybersec-network
+    restart: unless-stopped
+    command: >
+      sh -c "
+      python init_prod_db.py &&
+      uvicorn fastapi_backend:app --host 0.0.0.0 --port 8000
+      "
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cybersec-ui
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+      REACT_APP_ENV: production
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./frontend/ssl:/etc/nginx/ssl
+    networks:
+      - cybersec-network
+    restart: unless-stopped
+
+  # Optional: Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: cybersec-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - cybersec-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: cybersec-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - cybersec-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  cybersec-network:
+    driver: bridge
