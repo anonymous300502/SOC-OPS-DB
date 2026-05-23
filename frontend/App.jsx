@@ -184,6 +184,34 @@ class APIService {
     return await response.blob();
   }
 
+  async importSOARFlowsFile(modelId, file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await this.request(`${API_BASE}/import/soar-flows/file?model_id=${modelId}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+      body: formData,
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to import SOAR flows file');
+    }
+    return await response.json();
+  }
+
+  async exportSOARFlows(modelId) {
+    const response = await this.request(`${API_BASE}/export/soar-flows/${modelId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+    });
+    if (!response.ok) throw new Error('Failed to export SOAR flows');
+    return await response.blob();
+  }
+
   async createHighlight(modelId, data) {
     const response = await this.request(`${API_BASE}/models/${modelId}/highlights`, {
       method: 'POST',
@@ -564,6 +592,34 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
     reader.readAsText(file);
   };
 
+  const handleExportSOARFlows = async () => {
+    try {
+      const blob = await api.exportSOARFlows(modelId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `soar_flows_export_model_${modelId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('SOAR flows exported successfully!', 'success');
+    } catch (err) {
+      showToast(`Export failed: ${err.message}`, 'error');
+    }
+  };
+
+  const handleImportSOARFlows = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+      const res = await api.importSOARFlowsFile(modelId, file);
+      const successfulInserts = res.successful_inserts || 0;
+      showToast(`Import complete: ${successfulInserts} SOAR flows successfully imported!`, 'success');
+      await refreshDetails();
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
+  };
+
   const handleExportCSV = async () => {
     try {
       const blob = await api.exportCorrelationRulesCSV();
@@ -925,7 +981,7 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
               <h3 className="text-xl font-bold text-white">SOAR Workflows</h3>
               <div className="flex gap-2">
                 <button
-                  onClick={() => handleExport('soar-flows')}
+                  onClick={() => handleExportSOARFlows()}
                   className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm"
                 >
                   <Download className="w-4 h-4" /> Export
@@ -933,7 +989,7 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 {canEdit && (
                   <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer">
                     <Upload className="w-4 h-4" /> Import
-                    <input type="file" accept=".json" className="hidden" onChange={(e) => handleImport('soar-flows', e)} />
+                    <input type="file" accept=".json" className="hidden" onChange={(e) => handleImportSOARFlows(e)} />
                   </label>
                 )}
               </div>
@@ -944,6 +1000,7 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                   <h4 className="font-semibold text-white mb-2">{flow.name}</h4>
                   <p className="text-sm text-gray-400 mb-4">{flow.description}</p>
                   <SoarFlowViewer 
+                    workflow_json={flow.workflow_json}
                     playbook_constructor={flow.workflow_json?.playbook_constructor} 
                     playbook_details={flow.workflow_json?.playbook_details} 
                     steps={flow.workflow_json?.steps} 

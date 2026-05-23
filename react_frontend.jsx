@@ -184,6 +184,34 @@ class APIService {
     return await response.blob();
   }
 
+  async importSOARFlowsFile(modelId, file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await this.request(`${API_BASE}/import/soar-flows/file?model_id=${modelId}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+      body: formData,
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to import SOAR flows file');
+    }
+    return await response.json();
+  }
+
+  async exportSOARFlows(modelId) {
+    const response = await this.request(`${API_BASE}/export/soar-flows/${modelId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+      },
+    });
+    if (!response.ok) throw new Error('Failed to export SOAR flows');
+    return await response.blob();
+  }
+
   async createHighlight(modelId, data) {
     const response = await this.request(`${API_BASE}/models/${modelId}/highlights`, {
       method: 'POST',
@@ -532,7 +560,7 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
     if (type === 'correlation-rules') data = details.correlation_rules;
     if (type === 'parsers') data = details.parsers;
     if (type === 'soar-flows') data = details.soar_flows;
-    
+
     try {
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -564,6 +592,34 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
     reader.readAsText(file);
   };
 
+  const handleExportSOARFlows = async () => {
+    try {
+      const blob = await api.exportSOARFlows(modelId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `soar_flows_export_model_${modelId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('SOAR flows exported successfully!', 'success');
+    } catch (err) {
+      showToast(`Export failed: ${err.message}`, 'error');
+    }
+  };
+
+  const handleImportSOARFlows = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+      const res = await api.importSOARFlowsFile(modelId, file);
+      const successfulInserts = res.successful_inserts || 0;
+      showToast(`Import complete: ${successfulInserts} SOAR flows successfully imported!`, 'success');
+      await refreshDetails();
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
+  };
+
   const handleExportCSV = async () => {
     try {
       const blob = await api.exportCorrelationRulesCSV();
@@ -586,15 +642,15 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
       const res = await api.importCorrelationRulesCSV(file);
       const { successful_inserts, failed_rows } = res;
       const failedCount = failed_rows?.length || 0;
-      
+
       if (failedCount > 0) {
         showToast(
-          `Import complete: ${successful_inserts} rules successfully imported, ${failedCount} rows failed.`, 
+          `Import complete: ${successful_inserts} rules successfully imported, ${failedCount} rows failed.`,
           'warning'
         );
       } else {
         showToast(
-          `Import complete: ${successful_inserts} rules successfully imported!`, 
+          `Import complete: ${successful_inserts} rules successfully imported!`,
           'success'
         );
       }
@@ -626,15 +682,15 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
       const res = await api.importParsersText(modelId, file);
       const { successful_inserts, failed_rows } = res;
       const failedCount = failed_rows?.length || 0;
-      
+
       if (failedCount > 0) {
         showToast(
-          `Import complete: ${successful_inserts} parsers successfully imported, ${failedCount} lines failed.`, 
+          `Import complete: ${successful_inserts} parsers successfully imported, ${failedCount} lines failed.`,
           'warning'
         );
       } else {
         showToast(
-          `Import complete: ${successful_inserts} parsers successfully imported!`, 
+          `Import complete: ${successful_inserts} parsers successfully imported!`,
           'success'
         );
       }
@@ -720,11 +776,10 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
-              className={`px-4 py-3 whitespace-nowrap font-medium transition ${
-                activeTab === tab.id
-                  ? 'text-blue-400 border-b-2 border-blue-400'
-                  : 'text-gray-400 hover:text-white'
-              }`}
+              className={`px-4 py-3 whitespace-nowrap font-medium transition ${activeTab === tab.id
+                ? 'text-blue-400 border-b-2 border-blue-400'
+                : 'text-gray-400 hover:text-white'
+                }`}
             >
               {tab.icon} {tab.label}
             </button>
@@ -824,11 +879,10 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <div key={rule.id} className="p-4 bg-slate-700/50 rounded border border-slate-600">
                   <div className="flex items-start justify-between mb-2">
                     <h4 className="font-semibold text-white">{rule.name}</h4>
-                    <span className={`text-xs px-2 py-1 rounded ${
-                      rule.severity === 'critical' ? 'bg-red-500/20 text-red-300' :
+                    <span className={`text-xs px-2 py-1 rounded ${rule.severity === 'critical' ? 'bg-red-500/20 text-red-300' :
                       rule.severity === 'high' ? 'bg-orange-500/20 text-orange-300' :
-                      'bg-yellow-500/20 text-yellow-300'
-                    }`}>
+                        'bg-yellow-500/20 text-yellow-300'
+                      }`}>
                       {rule.severity}
                     </span>
                   </div>
@@ -925,7 +979,7 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
               <h3 className="text-xl font-bold text-white">SOAR Workflows</h3>
               <div className="flex gap-2">
                 <button
-                  onClick={() => handleExport('soar-flows')}
+                  onClick={() => handleExportSOARFlows()}
                   className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm"
                 >
                   <Download className="w-4 h-4" /> Export
@@ -933,7 +987,7 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 {canEdit && (
                   <label className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm cursor-pointer">
                     <Upload className="w-4 h-4" /> Import
-                    <input type="file" accept=".json" className="hidden" onChange={(e) => handleImport('soar-flows', e)} />
+                    <input type="file" accept=".json" className="hidden" onChange={(e) => handleImportSOARFlows(e)} />
                   </label>
                 )}
               </div>
@@ -943,10 +997,11 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <div key={flow.id} className="p-4 bg-slate-700/50 rounded border border-slate-600">
                   <h4 className="font-semibold text-white mb-2">{flow.name}</h4>
                   <p className="text-sm text-gray-400 mb-4">{flow.description}</p>
-                  <SoarFlowViewer 
-                    playbook_constructor={flow.workflow_json?.playbook_constructor} 
-                    playbook_details={flow.workflow_json?.playbook_details} 
-                    steps={flow.workflow_json?.steps} 
+                  <SoarFlowViewer
+                    workflow_json={flow.workflow_json}
+                    playbook_constructor={flow.workflow_json?.playbook_constructor}
+                    playbook_details={flow.workflow_json?.playbook_details}
+                    steps={flow.workflow_json?.steps}
                   />
                 </div>
               ))}
@@ -1029,12 +1084,11 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
             )}
             <div className="space-y-3">
               {details.highlights?.map((h, i) => (
-                <div key={i} className={`p-4 rounded border-l-4 ${
-                  h.priority === 'critical' ? 'bg-red-900/20 border-red-500' :
+                <div key={i} className={`p-4 rounded border-l-4 ${h.priority === 'critical' ? 'bg-red-900/20 border-red-500' :
                   h.priority === 'high' ? 'bg-orange-900/20 border-orange-500' :
-                  h.priority === 'medium' ? 'bg-yellow-900/20 border-yellow-500' :
-                  'bg-blue-900/20 border-blue-500'
-                }`}>
+                    h.priority === 'medium' ? 'bg-yellow-900/20 border-yellow-500' :
+                      'bg-blue-900/20 border-blue-500'
+                  }`}>
                   <h4 className="font-bold text-white">{h.title}</h4>
                   {h.content && <p className="text-gray-300 text-sm mt-1">{h.content}</p>}
                 </div>
@@ -1052,13 +1106,12 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
         {toasts.map((toast) => (
           <div
             key={toast.id}
-            className={`p-4 rounded shadow-lg border backdrop-blur flex items-start justify-between gap-3 text-sm transition-all duration-300 ${
-              toast.type === 'error'
-                ? 'bg-red-950/90 border-red-500/50 text-red-200 shadow-red-900/10'
-                : toast.type === 'warning'
+            className={`p-4 rounded shadow-lg border backdrop-blur flex items-start justify-between gap-3 text-sm transition-all duration-300 ${toast.type === 'error'
+              ? 'bg-red-950/90 border-red-500/50 text-red-200 shadow-red-900/10'
+              : toast.type === 'warning'
                 ? 'bg-amber-950/90 border-amber-500/50 text-amber-200 shadow-amber-900/10'
                 : 'bg-emerald-950/90 border-emerald-500/50 text-emerald-200 shadow-emerald-900/10'
-            }`}
+              }`}
           >
             <div className="flex-1">{toast.message}</div>
             <button

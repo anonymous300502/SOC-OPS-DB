@@ -1138,6 +1138,88 @@ async def import_soar_flows(
     db.commit()
     return {"message": f"Successfully imported {count} SOAR flows"}
 
+@app.post("/import/soar-flows/file")
+async def import_soar_flows_file(
+    model_id: int,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    """Securely imports SOAR flows from an uploaded JSON file"""
+    model = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+        
+    if not file.filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="File must be a .json file")
+
+    try:
+        content = await file.read()
+        data = json.loads(content.decode('utf-8'))
+        
+        # Unify format: ensure data is always a list to handle both playbook.json (dict) and soar_flows_import.json (list)
+        if isinstance(data, dict):
+            data = [data]
+            
+        successful_inserts = 0
+        
+        for item in data:
+            # Handle schema differences: 
+            # soar_flows_import.json has data nested in "workflow_json"
+            # playbook.json has data at the root level
+            if "workflow_json" in item:
+                workflow_data = item["workflow_json"]
+                name = item.get("name", workflow_data.get("name", "Imported Playbook"))
+                desc = item.get("description", workflow_data.get("description", ""))
+            else:
+                workflow_data = item
+                name = item.get("name", "Imported Playbook")
+                desc = item.get("description", "")
+                
+            new_flow = SOARFlow(
+                source_model_id=model_id,
+                name=name,
+                description=desc,
+                workflow_json=workflow_data
+            )
+            db.add(new_flow)
+            successful_inserts += 1
+            
+        db.commit()
+        return {"successful_inserts": successful_inserts}
+        
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON file format: {str(e)}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to import SOAR flows: {str(e)}")
+
+@app.get("/export/soar-flows/{model_id}")
+async def export_soar_flows(
+    model_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    """Exports all SOAR flows for a model into a downloadable JSON file"""
+    flows = db.query(SOARFlow).filter(SOARFlow.source_model_id == model_id).all()
+    
+    export_data = []
+    for flow in flows:
+        export_data.append({
+            "name": flow.name,
+            "description": flow.description,
+            "workflow_json": flow.workflow_json
+        })
+        
+    return Response(
+        content=json.dumps(export_data, indent=2),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f"attachment; filename=soar_flows_export_model_{model_id}.json",
+            "Content-Type": "application/json"
+        }
+    )
+
 # ============================================================================
 # STATIC DATA ENDPOINTS (Super Admin only)
 # ============================================================================

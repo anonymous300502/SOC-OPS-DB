@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
 import 'reactflow/dist/style.css';
 
-export default function SoarFlowViewer({ playbook_constructor, playbook_details, steps }) {
+export default function SoarFlowViewer({ workflow_json, playbook_constructor, playbook_details, steps }) {
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
   const [error, setError] = useState(null);
@@ -13,23 +13,22 @@ export default function SoarFlowViewer({ playbook_constructor, playbook_details,
     setNodes([]);
     setEdges([]);
 
+    // Intelligent Prop Extraction: Fallback to workflow_json if individual props aren't passed
+    const p_constructor = playbook_constructor || workflow_json?.playbook_constructor;
+    const p_details = playbook_details || workflow_json?.playbook_details;
+    const p_steps = steps || workflow_json?.steps;
+
     // Check if we have playbook constructor or playbook details (complex flow)
-    if (playbook_constructor || playbook_details) {
+    if (p_constructor || p_details) {
       try {
-        let constructorData = playbook_constructor;
-        if (typeof constructorData === 'string') {
+        let constructorData = p_constructor;
+        while (typeof constructorData === 'string') {
           constructorData = JSON.parse(constructorData);
-          if (typeof constructorData === 'string') {
-            constructorData = JSON.parse(constructorData);
-          }
         }
 
-        let detailsData = playbook_details;
-        if (typeof detailsData === 'string') {
+        let detailsData = p_details;
+        while (typeof detailsData === 'string') {
           detailsData = JSON.parse(detailsData);
-          if (typeof detailsData === 'string') {
-            detailsData = JSON.parse(detailsData);
-          }
         }
 
         if (!constructorData) {
@@ -96,13 +95,13 @@ export default function SoarFlowViewer({ playbook_constructor, playbook_details,
         console.error('SOAR visualizer parse error:', err);
         setError(err.message);
       }
-    } else if (steps && steps.length > 0) {
+    } else if (p_steps && p_steps.length > 0) {
       // Fallback for simple linear steps list
       try {
         const newNodes = [];
         const newEdges = [];
 
-        steps.forEach((step, index) => {
+        p_steps.forEach((step, index) => {
           const id = `step-${step.id || index}`;
           newNodes.push({
             id: id,
@@ -125,7 +124,7 @@ export default function SoarFlowViewer({ playbook_constructor, playbook_details,
           });
 
           if (index > 0) {
-            const prevId = `step-${steps[index - 1].id || index - 1}`;
+            const prevId = `step-${p_steps[index - 1].id || index - 1}`;
             newEdges.push({
               id: `edge-${index}`,
               source: prevId,
@@ -142,7 +141,7 @@ export default function SoarFlowViewer({ playbook_constructor, playbook_details,
         setError(err.message);
       }
     }
-  }, [playbook_constructor, playbook_details, steps]);
+  }, [workflow_json, playbook_constructor, playbook_details, steps]);
 
   if (error) {
     return (
