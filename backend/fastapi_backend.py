@@ -13,8 +13,9 @@ from datetime import datetime, timedelta
 import jwt
 import bcrypt
 from functools import wraps
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker, joinedload
 from sqlalchemy import and_, create_engine
+from sqlalchemy.exc import IntegrityError
 import os
 import csv
 import codecs
@@ -246,7 +247,10 @@ def verify_token(token: str) -> dict:
 security = HTTPBearer()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///cybersec_dashboard.db")
-engine = create_engine(DATABASE_URL)
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
@@ -326,9 +330,11 @@ app = FastAPI(
 )
 
 # CORS Configuration
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -354,9 +360,17 @@ async def register(
             detail="Username or email already registered"
         )
     
-    role = RoleEnum.ANALYST
-    if current_user and current_user.get("role") in [RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN]:
-        role = user.role
+    valid_roles = {r.value for r in RoleEnum}
+    if user.role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {sorted(valid_roles)}")
+
+    role = RoleEnum.ANALYST.value
+    if current_user:
+        current_role = current_user.get("role")
+        if current_role == RoleEnum.SUPER_ADMIN.value:
+            role = user.role
+        elif current_role == RoleEnum.ADMIN.value and user.role in [RoleEnum.ANALYST.value, RoleEnum.ADMIN.value]:
+            role = user.role
         
     hashed_pwd = hash_password(user.password)
     db_user = User(
@@ -468,10 +482,16 @@ async def get_models_for_vector(
     if not vec:
         raise HTTPException(status_code=404, detail="Vector not found")
         
-    mappings = db.query(ModelFrameworkMap).filter(
-        ModelFrameworkMap.framework_vector_id == vec.id
-    ).all()
-    
+    mappings = (
+        db.query(ModelFrameworkMap)
+        .options(
+            joinedload(ModelFrameworkMap.source_model).joinedload(SourceModel.source_type),
+            joinedload(ModelFrameworkMap.source_model).joinedload(SourceModel.brand),
+        )
+        .filter(ModelFrameworkMap.framework_vector_id == vec.id)
+        .all()
+    )
+
     result = []
     for m in mappings:
         model = m.source_model
@@ -498,10 +518,30 @@ async def get_model_details(
     GET /models/{model_id}
     Returns complete model details with all artifacts
     """
-    model = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    model = (
+        db.query(SourceModel)
+        .options(
+            joinedload(SourceModel.source_type),
+            joinedload(SourceModel.brand),
+            joinedload(SourceModel.correlation_mappings).joinedload(ModelCorrelationMap.correlation_rule),
+            joinedload(SourceModel.parsers),
+            joinedload(SourceModel.soar_flows),
+            joinedload(SourceModel.highlights),
+        )
+        .filter(SourceModel.id == model_id)
+        .first()
+    )
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-        
+
+    compliances = db.query(Compliance).all()
+    attack_vectors = db.query(AttackVector).all()
+    highlights = (
+        db.query(Highlight)
+        .filter((Highlight.source_model_id == model_id) | (Highlight.source_model_id == None))
+        .all()
+    )
+
     return {
         "id": model.id,
         "source_type": model.source_type.name if model.source_type else "Unknown",
@@ -545,30 +585,16 @@ async def get_model_details(
             for f in model.soar_flows
         ],
         "compliance": [
-            {
-                "framework": c.name,
-                "requirement": req
-            }
-            for c in db.query(Compliance).all() for req in (c.requirements or [])
+            {"framework": c.name, "requirement": req}
+            for c in compliances for req in (c.requirements or [])
         ],
         "attack_vectors": [
-            {
-                "vector": a.name,
-                "severity": a.severity,
-                "description": a.description
-            }
-            for a in db.query(AttackVector).all()
+            {"vector": a.name, "severity": a.severity, "description": a.description}
+            for a in attack_vectors
         ],
         "highlights": [
-            {
-                "id": h.id,
-                "title": h.title,
-                "content": h.content,
-                "priority": h.priority
-            }
-            for h in db.query(Highlight).filter(
-                (Highlight.source_model_id == model_id) | (Highlight.source_model_id == None)
-            ).all()
+            {"id": h.id, "title": h.title, "content": h.content, "priority": h.priority}
+            for h in highlights
         ]
     }
 
@@ -813,28 +839,39 @@ async def import_correlation_rules_csv(
             detail="File must be a .csv or .txt file"
         )
     
+    def _strip(val):
+        """Strip surrounding quotes from a CSV field parsed with QUOTE_NONE."""
+        if val is None:
+            return ""
+        v = val.strip()
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            return v[1:-1]
+        return v
+
     successful_inserts = 0
     failed_rows = []
-    
+
     try:
-        reader = csv.DictReader(codecs.iterdecode(file.file, 'utf-8'), delimiter='|')
+        reader = csv.DictReader(
+            codecs.iterdecode(file.file, "utf-8"),
+            delimiter="|",
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+        )
         line_num = 1
         for row in reader:
             line_num += 1
-            rule_name = row.get("Rule Name")
-            rule_desc = row.get("Rule Desc")
-            severity = row.get("Severity")
-            created_by = row.get("Created By")
-            rule_builder_str = row.get("rule_builder")
-            tactics = row.get("tactics", "")
-            
+            rule_name = _strip(row.get("Rule Name"))
+            rule_desc = _strip(row.get("Rule Desc"))
+            severity = _strip(row.get("Severity"))
+            created_by = _strip(row.get("Created By"))
+            rule_builder_str = _strip(row.get("rule_builder"))
+            tactics = _strip(row.get("tactics", ""))
+
             if not rule_name:
-                failed_rows.append({
-                    "line": line_num,
-                    "reason": "Missing required field: Rule Name"
-                })
+                failed_rows.append({"line": line_num, "reason": "Missing required field: Rule Name"})
                 continue
-                
+
             if rule_builder_str:
                 try:
                     rule_logic = json.loads(rule_builder_str)
@@ -842,33 +879,33 @@ async def import_correlation_rules_csv(
                     rule_logic = {"raw_query": rule_builder_str}
             else:
                 rule_logic = {"raw_query": ""}
-                
+
             tags = [t.strip() for t in tactics.split(",") if t.strip()] if tactics else []
-            
+            sev = severity.lower() if severity else "medium"
+
             try:
-                rule = CorrelationRule(
-                    name=rule_name,
-                    description=rule_desc,
-                    rule_logic=rule_logic,
-                    author=created_by or current_user.get("username", "Unknown"),
-                    severity=severity.lower() if severity else "medium",
-                    tags=tags
-                )
-                db.add(rule)
-                db.flush()
+                with db.begin_nested():
+                    rule = CorrelationRule(
+                        name=rule_name,
+                        description=rule_desc,
+                        rule_logic=rule_logic,
+                        author=created_by or current_user.get("username", "Unknown"),
+                        severity=sev,
+                        tags=tags,
+                    )
+                    db.add(rule)
                 successful_inserts += 1
+            except IntegrityError as e:
+                failed_rows.append({"line": line_num, "reason": f"Duplicate entry: {str(e.orig)}"})
             except Exception as e:
-                db.rollback()
-                failed_rows.append({
-                    "line": line_num,
-                    "reason": f"Database insertion failed: {str(e)}"
-                })
-                
+                failed_rows.append({"line": line_num, "reason": f"Database error: {str(e)}"})
+
         db.commit()
     except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to parse CSV file: {str(e)}"
+            detail=f"Failed to parse CSV file: {str(e)}",
         )
         
     return {
@@ -956,21 +993,22 @@ async def import_parsers_text(
         
     successful_inserts = 0
     failed_rows = []
-    
+
     try:
         content = await file.read()
-        lines = content.decode('utf-8').splitlines()
-        
+        lines = content.decode("utf-8").splitlines()
+
         line_num = 0
+        parser_counts: dict = {}
         for line in lines:
             line_num += 1
             stripped = line.strip()
             if not stripped:
                 continue
-                
+
             parser_format = "kv"
-            parser_config = {}
-            
+            parser_config: dict = {}
+
             try:
                 if stripped.startswith("CEF:"):
                     parser_format = "cef"
@@ -987,30 +1025,33 @@ async def import_parsers_text(
                 else:
                     parser_format = "kv"
                     parser_config = {"pattern": stripped}
-                    
-                new_parser = Parser(
-                    source_model_id=model_id,
-                    name=f"Imported Parser - {parser_format.upper()}",
-                    format=parser_format,
-                    parser_config=parser_config,
-                    description=f"Imported from multi-format text file (line {line_num})",
-                    is_active=True
-                )
-                db.add(new_parser)
-                db.flush()
+
+                parser_counts[parser_format] = parser_counts.get(parser_format, 0) + 1
+                seq = parser_counts[parser_format]
+                parser_name = f"Imported {parser_format.upper()} Parser" + (f" #{seq}" if seq > 1 else "")
+
+                with db.begin_nested():
+                    new_parser = Parser(
+                        source_model_id=model_id,
+                        name=parser_name,
+                        format=parser_format,
+                        parser_config=parser_config,
+                        description=f"Imported from text file (line {line_num})",
+                        is_active=True,
+                    )
+                    db.add(new_parser)
                 successful_inserts += 1
+            except json.JSONDecodeError as e:
+                failed_rows.append({"line": line_num, "reason": f"Invalid JSON config: {str(e)}"})
             except Exception as e:
-                db.rollback()
-                failed_rows.append({
-                    "line": line_num,
-                    "reason": f"Parsing/Insertion failed: {str(e)}"
-                })
-                
+                failed_rows.append({"line": line_num, "reason": f"Insertion failed: {str(e)}"})
+
         db.commit()
     except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process text file: {str(e)}"
+            detail=f"Failed to process text file: {str(e)}",
         )
         
     return {
@@ -1150,7 +1191,7 @@ async def import_soar_flows_file(
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
         
-    if not file.filename.endswith(".json"):
+    if not (file.filename or "").lower().endswith(".json"):
         raise HTTPException(status_code=400, detail="File must be a .json file")
 
     try:

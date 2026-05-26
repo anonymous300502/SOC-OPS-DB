@@ -39,6 +39,7 @@ class ParserFormatEnum(str, Enum):
     CSV = "csv"
     CEF = "cef"
     XML = "xml"
+    SYSLOG_GROK = "syslog_grok"
 
 # ============================================================================
 # AUTH & ACCESS CONTROL

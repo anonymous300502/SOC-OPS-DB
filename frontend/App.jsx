@@ -8,7 +8,7 @@ import SoarFlowViewer from './src/components/SoarFlowViewer';
 // API SERVICE LAYER
 // ============================================================================
 
-const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 class APIService {
   constructor() {
@@ -883,14 +883,17 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                     <span className={`text-xs px-2 py-1 rounded ${
                       rule.severity === 'critical' ? 'bg-red-500/20 text-red-300' :
                       rule.severity === 'high' ? 'bg-orange-500/20 text-orange-300' :
-                      'bg-yellow-500/20 text-yellow-300'
+                      rule.severity === 'medium' ? 'bg-yellow-500/20 text-yellow-300' :
+                      'bg-blue-500/20 text-blue-300'
                     }`}>
                       {rule.severity}
                     </span>
                   </div>
                   <p className="text-sm text-gray-400 mb-2">{rule.description}</p>
                   <div className="mt-2 mb-3 text-xs font-mono text-gray-300 bg-slate-800 p-2 rounded overflow-x-auto whitespace-pre-wrap">
-                    {rule.rule_logic}
+                    {typeof rule.rule_logic === 'string'
+                      ? rule.rule_logic
+                      : JSON.stringify(rule.rule_logic, null, 2)}
                   </div>
                   <div className="text-xs text-gray-500">
                     By {rule.author} • {new Date(rule.created_at).toLocaleDateString()}
