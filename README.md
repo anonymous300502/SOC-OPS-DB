@@ -11,8 +11,6 @@ A production full-stack application for organizing and mapping security data acr
 
 ## 🔐 Access model
 
-There are **no demo or default credentials** anywhere in the application.
-
 | Capability                              | Analyst | Admin | Super Admin |
 |-----------------------------------------|:-------:|:-----:|:-----------:|
 | View all data                           |   ✅    |  ✅   |     ✅      |
@@ -37,10 +35,6 @@ A single **super admin** is bootstrapped from environment variables on first sta
 ## 🚀 Quick start
 
 ### 1. Configure environment
-
-```bash
-cp .env.example .env
-```
 
 Edit `.env` and set strong values. At minimum you must provide:
 
