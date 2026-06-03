@@ -221,6 +221,78 @@ class APIService {
     if (!response.ok) throw new Error('Failed to create highlight');
     return await response.json();
   }
+
+  async _delete(path, label) {
+    const response = await this.request(`${API_BASE}${path}`, {
+      method: 'DELETE',
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || `Failed to delete ${label}`);
+    }
+    return await response.json();
+  }
+
+  deleteParser(id) { return this._delete(`/parsers/${id}`, 'parser'); }
+  deleteCorrelationRule(id) { return this._delete(`/correlation-rules/${id}`, 'correlation rule'); }
+  deleteSOARFlow(id) { return this._delete(`/soar-flows/${id}`, 'SOAR flow'); }
+  deleteHighlight(id) { return this._delete(`/highlights/${id}`, 'highlight'); }
+
+  // -- User management (admin+) --
+  async getMe() {
+    const response = await this.request(`${API_BASE}/auth/me`, {
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to fetch current user');
+    return await response.json();
+  }
+
+  async getUsers() {
+    const response = await this.request(`${API_BASE}/auth/users`, {
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to fetch users');
+    return await response.json();
+  }
+
+  async createUser(user) {
+    const response = await this.request(`${API_BASE}/auth/users`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(user),
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to create user');
+    }
+    return await response.json();
+  }
+
+  async updateUser(userId, update) {
+    const response = await this.request(`${API_BASE}/auth/users/${userId}`, {
+      method: 'PATCH',
+      headers: this.getHeaders(),
+      body: JSON.stringify(update),
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to update user');
+    }
+    return await response.json();
+  }
+
+  async deleteUser(userId) {
+    const response = await this.request(`${API_BASE}/auth/users/${userId}`, {
+      method: 'DELETE',
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Failed to delete user');
+    }
+    return await response.json();
+  }
 }
 
 const api = new APIService();
@@ -242,7 +314,7 @@ function LoginPage({ onLogin }) {
     setError('');
     try {
       const data = await api.login(username, password);
-      onLogin(data.role);
+      onLogin(data.role, data.username);
     } catch (err) {
       setError(err.message);
     }
@@ -272,7 +344,8 @@ function LoginPage({ onLogin }) {
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
-                placeholder="analyst"
+                placeholder="Username"
+                autoComplete="username"
               />
             </div>
 
@@ -286,6 +359,7 @@ function LoginPage({ onLogin }) {
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
                 placeholder="••••••••"
+                autoComplete="current-password"
               />
             </div>
 
@@ -304,12 +378,9 @@ function LoginPage({ onLogin }) {
             </button>
           </form>
 
-          <div className="mt-6 p-4 bg-slate-700/50 rounded text-xs text-gray-400">
-            <p className="font-semibold mb-2">Demo Credentials:</p>
-            <p>analyst / demo (read-only)</p>
-            <p>admin / demo (manage artifacts)</p>
-            <p>superadmin / demo (full control)</p>
-          </div>
+          <p className="mt-6 text-center text-xs text-gray-500">
+            Access is managed by your administrator. Contact them if you need an account.
+          </p>
         </div>
       </div>
     </div>
@@ -700,6 +771,20 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
     }
   };
 
+  const handleDeleteArtifact = async (kind, id, name) => {
+    if (!window.confirm(`Delete ${kind} "${name}"? This cannot be undone.`)) return;
+    try {
+      if (kind === 'parser') await api.deleteParser(id);
+      else if (kind === 'correlation rule') await api.deleteCorrelationRule(id);
+      else if (kind === 'SOAR flow') await api.deleteSOARFlow(id);
+      else if (kind === 'highlight') await api.deleteHighlight(id);
+      showToast(`${kind.charAt(0).toUpperCase() + kind.slice(1)} deleted.`, 'success');
+      await refreshDetails();
+    } catch (err) {
+      showToast(`Failed to delete ${kind}: ${err.message}`, 'error');
+    }
+  };
+
   const handleCreateHighlight = async (e) => {
     e.preventDefault();
     try {
@@ -880,14 +965,25 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <div key={rule.id} className="p-4 bg-slate-700/50 rounded border border-slate-600">
                   <div className="flex items-start justify-between mb-2">
                     <h4 className="font-semibold text-white">{rule.name}</h4>
-                    <span className={`text-xs px-2 py-1 rounded ${
-                      rule.severity === 'critical' ? 'bg-red-500/20 text-red-300' :
-                      rule.severity === 'high' ? 'bg-orange-500/20 text-orange-300' :
-                      rule.severity === 'medium' ? 'bg-yellow-500/20 text-yellow-300' :
-                      'bg-blue-500/20 text-blue-300'
-                    }`}>
-                      {rule.severity}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className={`text-xs px-2 py-1 rounded ${
+                        rule.severity === 'critical' ? 'bg-red-500/20 text-red-300' :
+                        rule.severity === 'high' ? 'bg-orange-500/20 text-orange-300' :
+                        rule.severity === 'medium' ? 'bg-yellow-500/20 text-yellow-300' :
+                        'bg-blue-500/20 text-blue-300'
+                      }`}>
+                        {rule.severity}
+                      </span>
+                      {canEdit && (
+                        <button
+                          onClick={() => handleDeleteArtifact('correlation rule', rule.id, rule.name)}
+                          className="text-red-400 hover:text-red-300"
+                          title="Delete rule"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <p className="text-sm text-gray-400 mb-2">{rule.description}</p>
                   <div className="mt-2 mb-3 text-xs font-mono text-gray-300 bg-slate-800 p-2 rounded overflow-x-auto whitespace-pre-wrap">
@@ -956,9 +1052,20 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <div key={parser.id} className="p-4 bg-slate-700/50 rounded border border-slate-600">
                   <div className="flex items-center justify-between mb-2">
                     <h4 className="font-semibold text-white">{parser.name}</h4>
-                    <span className="text-xs bg-blue-500/20 text-blue-300 px-2 py-1 rounded">
-                      {parser.format.toUpperCase()}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs bg-blue-500/20 text-blue-300 px-2 py-1 rounded">
+                        {parser.format.toUpperCase()}
+                      </span>
+                      {canEdit && (
+                        <button
+                          onClick={() => handleDeleteArtifact('parser', parser.id, parser.name)}
+                          className="text-red-400 hover:text-red-300"
+                          title="Delete parser"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <p className="text-sm text-gray-400">{parser.description}</p>
                   {parser.parser_config && (
@@ -1000,7 +1107,18 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
             <div className="space-y-3">
               {details.soar_flows?.map((flow) => (
                 <div key={flow.id} className="p-4 bg-slate-700/50 rounded border border-slate-600">
-                  <h4 className="font-semibold text-white mb-2">{flow.name}</h4>
+                  <div className="flex items-start justify-between mb-2">
+                    <h4 className="font-semibold text-white">{flow.name}</h4>
+                    {canEdit && (
+                      <button
+                        onClick={() => handleDeleteArtifact('SOAR flow', flow.id, flow.name)}
+                        className="text-red-400 hover:text-red-300"
+                        title="Delete SOAR flow"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
                   <p className="text-sm text-gray-400 mb-4">{flow.description}</p>
                   <SoarFlowViewer 
                     workflow_json={flow.workflow_json}
@@ -1089,13 +1207,24 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
             )}
             <div className="space-y-3">
               {details.highlights?.map((h, i) => (
-                <div key={i} className={`p-4 rounded border-l-4 ${
+                <div key={h.id ?? i} className={`p-4 rounded border-l-4 ${
                   h.priority === 'critical' ? 'bg-red-900/20 border-red-500' :
                   h.priority === 'high' ? 'bg-orange-900/20 border-orange-500' :
                   h.priority === 'medium' ? 'bg-yellow-900/20 border-yellow-500' :
                   'bg-blue-900/20 border-blue-500'
                 }`}>
-                  <h4 className="font-bold text-white">{h.title}</h4>
+                  <div className="flex items-start justify-between">
+                    <h4 className="font-bold text-white">{h.title}</h4>
+                    {canEdit && h.id != null && (
+                      <button
+                        onClick={() => handleDeleteArtifact('highlight', h.id, h.title)}
+                        className="text-red-400 hover:text-red-300"
+                        title="Delete highlight"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
                   {h.content && <p className="text-gray-300 text-sm mt-1">{h.content}</p>}
                 </div>
               ))}
@@ -1252,12 +1381,211 @@ function CreateRuleForm({ modelId, onClose, onSuccess }) {
 }
 
 // ============================================================================
+// USER MANAGEMENT (admin / super_admin)
+// ============================================================================
+
+function UserManagement({ userRole, currentUsername }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [form, setForm] = useState({ username: '', email: '', password: '', role: 'analyst' });
+  const [submitting, setSubmitting] = useState(false);
+
+  // Roles this actor is allowed to assign (mirrors backend rules).
+  const assignableRoles = userRole === 'super_admin'
+    ? ['analyst', 'admin', 'super_admin']
+    : ['analyst', 'admin'];
+
+  const canManage = (target) => {
+    if (userRole === 'super_admin') return true;
+    return target.role !== 'super_admin';
+  };
+
+  const loadUsers = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      setUsers(await api.getUsers());
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { loadUsers(); }, [loadUsers]);
+
+  const handleCreate = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setError('');
+    setNotice('');
+    try {
+      await api.createUser(form);
+      setNotice(`User "${form.username}" created.`);
+      setForm({ username: '', email: '', password: '', role: 'analyst' });
+      await loadUsers();
+    } catch (err) {
+      setError(err.message);
+    }
+    setSubmitting(false);
+  };
+
+  const handleDelete = async (user) => {
+    if (!window.confirm(`Delete user "${user.username}"? This cannot be undone.`)) return;
+    setError('');
+    setNotice('');
+    try {
+      await api.deleteUser(user.id);
+      setNotice(`User "${user.username}" deleted.`);
+      await loadUsers();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const handleToggleActive = async (user) => {
+    setError('');
+    setNotice('');
+    try {
+      await api.updateUser(user.id, { is_active: !user.is_active });
+      await loadUsers();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  return (
+    <div>
+      <h2 className="text-2xl font-bold text-white mb-6">User Management</h2>
+
+      {error && (
+        <div className="mb-4 bg-red-500/10 border border-red-500/50 text-red-300 px-4 py-2 rounded text-sm">{error}</div>
+      )}
+      {notice && (
+        <div className="mb-4 bg-green-500/10 border border-green-500/50 text-green-300 px-4 py-2 rounded text-sm">{notice}</div>
+      )}
+
+      {/* Create user */}
+      <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-6 mb-8">
+        <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+          <Plus className="w-5 h-5 text-blue-400" /> Create User
+        </h3>
+        <form onSubmit={handleCreate} className="grid grid-cols-1 md:grid-cols-5 gap-3">
+          <input
+            required
+            value={form.username}
+            onChange={(e) => setForm({ ...form, username: e.target.value })}
+            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+            placeholder="Username"
+            autoComplete="off"
+          />
+          <input
+            required
+            type="email"
+            value={form.email}
+            onChange={(e) => setForm({ ...form, email: e.target.value })}
+            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+            placeholder="Email"
+            autoComplete="off"
+          />
+          <input
+            required
+            type="password"
+            minLength={8}
+            value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })}
+            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+            placeholder="Password (min 8)"
+            autoComplete="new-password"
+          />
+          <select
+            value={form.role}
+            onChange={(e) => setForm({ ...form, role: e.target.value })}
+            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+          >
+            {assignableRoles.map((r) => (
+              <option key={r} value={r}>{r}</option>
+            ))}
+          </select>
+          <button
+            type="submit"
+            disabled={submitting}
+            className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded text-sm transition disabled:opacity-50"
+          >
+            {submitting ? 'Creating…' : 'Create'}
+          </button>
+        </form>
+      </div>
+
+      {/* User list */}
+      <div className="bg-slate-800/50 border border-slate-700 rounded-lg overflow-hidden">
+        {loading ? (
+          <p className="text-gray-400 p-6">Loading users…</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-slate-700/50 text-gray-300">
+              <tr>
+                <th className="text-left px-4 py-3">Username</th>
+                <th className="text-left px-4 py-3">Email</th>
+                <th className="text-left px-4 py-3">Role</th>
+                <th className="text-left px-4 py-3">Status</th>
+                <th className="text-right px-4 py-3">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((u) => {
+                const isSelf = u.username === currentUsername;
+                const manageable = canManage(u) && !isSelf;
+                return (
+                  <tr key={u.id} className="border-t border-slate-700 text-gray-200">
+                    <td className="px-4 py-3 font-medium">
+                      {u.username}{isSelf && <span className="ml-2 text-xs text-blue-400">(you)</span>}
+                    </td>
+                    <td className="px-4 py-3 text-gray-400">{u.email}</td>
+                    <td className="px-4 py-3 capitalize">{u.role.replace('_', ' ')}</td>
+                    <td className="px-4 py-3">
+                      <span className={u.is_active ? 'text-green-400' : 'text-gray-500'}>
+                        {u.is_active ? 'Active' : 'Inactive'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => handleToggleActive(u)}
+                          disabled={!manageable}
+                          className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs transition disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          {u.is_active ? 'Deactivate' : 'Activate'}
+                        </button>
+                        <button
+                          onClick={() => handleDelete(u)}
+                          disabled={!manageable}
+                          className="px-3 py-1 bg-red-600/80 hover:bg-red-600 rounded text-xs transition disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" /> Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // MAIN APP
 // ============================================================================
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(!!localStorage.getItem('auth_token'));
   const [userRole, setUserRole] = useState(localStorage.getItem('user_role') || 'analyst');
+  const [username, setUsername] = useState(localStorage.getItem('username') || '');
   const [currentPage, setCurrentPage] = useState('frameworks');
   const [selectedFramework, setSelectedFramework] = useState(null);
   const [selectedVector, setSelectedVector] = useState(null);
@@ -1265,20 +1593,25 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState(null);
   const [selectedModelName, setSelectedModelName] = useState(null);
 
-  const handleLogin = (role) => {
+  const handleLogin = (role, uname) => {
     setIsLoggedIn(true);
     setUserRole(role);
+    setUsername(uname || '');
     localStorage.setItem('auth_token', api.token);
     localStorage.setItem('user_role', role);
+    localStorage.setItem('username', uname || '');
   };
 
   const handleLogout = () => {
     setIsLoggedIn(false);
     localStorage.removeItem('auth_token');
     localStorage.removeItem('user_role');
+    localStorage.removeItem('username');
     api.token = null;
     setCurrentPage('frameworks');
   };
+
+  const isAdmin = ['admin', 'super_admin'].includes(userRole);
 
   if (!isLoggedIn) {
     return <LoginPage onLogin={handleLogin} userRole={userRole} />;
@@ -1294,8 +1627,23 @@ export default function App() {
             <h1 className="text-2xl font-bold text-white">SecIntel</h1>
           </div>
           <div className="flex items-center gap-4">
+            <button
+              onClick={() => setCurrentPage('frameworks')}
+              className={`px-3 py-2 rounded text-sm transition ${currentPage !== 'users' ? 'text-blue-400 font-semibold' : 'text-gray-300 hover:text-white'}`}
+            >
+              Dashboard
+            </button>
+            {isAdmin && (
+              <button
+                onClick={() => setCurrentPage('users')}
+                className={`px-3 py-2 rounded text-sm transition ${currentPage === 'users' ? 'text-blue-400 font-semibold' : 'text-gray-300 hover:text-white'}`}
+              >
+                Users
+              </button>
+            )}
             <span className="text-gray-400 text-sm">
-              Role: <span className="font-semibold text-blue-400 capitalize">{userRole}</span>
+              {username && <span className="text-gray-300">{username} · </span>}
+              <span className="font-semibold text-blue-400 capitalize">{userRole.replace('_', ' ')}</span>
             </span>
             <button
               onClick={handleLogout}
@@ -1309,6 +1657,10 @@ export default function App() {
 
       {/* MAIN CONTENT */}
       <main className="max-w-7xl mx-auto px-6 py-12">
+        {currentPage === 'users' && isAdmin && (
+          <UserManagement userRole={userRole} currentUsername={username} />
+        )}
+
         {currentPage === 'frameworks' && (
           <FrameworkSelector
             onSelectFramework={(fw) => {

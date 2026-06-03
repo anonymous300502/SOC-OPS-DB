@@ -20,32 +20,97 @@ from database_models import (
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///cybersec_dashboard.db")
 
+# Minimum length enforced for the bootstrap super-admin password.
+MIN_PASSWORD_LENGTH = 8
+
 def hash_password(password: str) -> str:
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode(), salt).decode()
 
+def get_super_admin_config():
+    """Read the bootstrap super-admin credentials from the environment.
+
+    Required env vars: SUPER_ADMIN_USERNAME, SUPER_ADMIN_PASSWORD,
+    SUPER_ADMIN_EMAIL. Exits with an error if any are missing or the
+    password is too weak — there are no hardcoded/demo credentials.
+    """
+    username = os.getenv("SUPER_ADMIN_USERNAME", "").strip()
+    password = os.getenv("SUPER_ADMIN_PASSWORD", "")
+    email = os.getenv("SUPER_ADMIN_EMAIL", "").strip()
+
+    missing = [
+        name for name, val in (
+            ("SUPER_ADMIN_USERNAME", username),
+            ("SUPER_ADMIN_PASSWORD", password),
+            ("SUPER_ADMIN_EMAIL", email),
+        ) if not val
+    ]
+    if missing:
+        print(
+            "❌ Cannot bootstrap the super admin account. Missing required "
+            f"environment variable(s): {', '.join(missing)}.\n"
+            "   Set SUPER_ADMIN_USERNAME, SUPER_ADMIN_PASSWORD and "
+            "SUPER_ADMIN_EMAIL before initializing the database."
+        )
+        sys.exit(1)
+    if len(password) < MIN_PASSWORD_LENGTH:
+        print(
+            f"❌ SUPER_ADMIN_PASSWORD must be at least {MIN_PASSWORD_LENGTH} "
+            "characters long."
+        )
+        sys.exit(1)
+    return username, password, email
+
+def ensure_super_admin(db):
+    """Create the bootstrap super-admin from env vars if it does not exist.
+
+    Idempotent: runs on every startup. If a user with the configured
+    username already exists it is left untouched (passwords are managed via
+    the API afterwards, never reset from the environment).
+    """
+    username, password, email = get_super_admin_config()
+    existing = db.query(User).filter(User.username == username).first()
+    if existing:
+        print(f"✅ Super admin '{username}' already exists. Skipping bootstrap.")
+        return
+    db.add(User(
+        username=username,
+        email=email,
+        password_hash=hash_password(password),
+        role=RoleEnum.SUPER_ADMIN.value,
+        is_active=True,
+    ))
+    db.commit()
+    print(f"👑 Bootstrap super admin '{username}' created.")
+
 def init_database():
-    """Initialize database and populate with sample data"""
-    
+    """Initialize database, seed reference catalog (once) and bootstrap admin."""
+
     print("🔧 Initializing database...")
     engine = create_engine(DATABASE_URL)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     db = Session()
-    
-    # Check if database is already seeded
-    try:
-        user_count = db.query(User).count()
-    except Exception:
-        user_count = 0
-        
+
+    # Validate super-admin config up front so we fail fast before any writes.
+    get_super_admin_config()
+
+    # Seed the reference catalog only when the database is empty (no
+    # frameworks) unless explicitly forced. This protects user-created and
+    # uploaded data from being wiped on every restart.
     force_seed = os.getenv("FORCE_SEED", "false").lower() == "true"
-    if user_count > 0 and not force_seed:
-        print("✅ Database already populated. Skipping seeding. Use FORCE_SEED=true to force re-initialization.")
+    try:
+        framework_count = db.query(Framework).count()
+    except Exception:
+        framework_count = 0
+
+    if framework_count > 0 and not force_seed:
+        print("✅ Catalog already populated. Skipping seed. Use FORCE_SEED=true to re-seed.")
+        ensure_super_admin(db)
         db.close()
         return
-        
-    print("🧹 Clearing existing data...")
+
+    print("🧹 Clearing existing catalog data...")
     # Clear existing data
     db.query(ModelFrameworkMap).delete()
     db.query(ModelCorrelationMap).delete()
@@ -652,43 +717,17 @@ def init_database():
         ),
     ]
     db.add_all(highlights)
-    
+
     db.flush()
-    
-    # ========================================================================
-    # USERS
-    # ========================================================================
-    
-    print("👥 Creating demo users...")
-    
-    users = [
-        User(
-            username="analyst",
-            email="analyst@company.com",
-            password_hash=hash_password("demo"),
-            role="analyst",
-            is_active=True
-        ),
-        User(
-            username="admin",
-            email="admin@company.com",
-            password_hash=hash_password("demo"),
-            role="admin",
-            is_active=True
-        ),
-        User(
-            username="superadmin",
-            email="superadmin@company.com",
-            password_hash=hash_password("demo"),
-            role="super_admin",
-            is_active=True
-        ),
-    ]
-    db.add_all(users)
-    
     db.commit()
+
+    # ========================================================================
+    # BOOTSTRAP SUPER ADMIN (from environment, no demo/default credentials)
+    # ========================================================================
+    ensure_super_admin(db)
+
     db.close()
-    
+
     print("\n" + "="*60)
     print("✅ DATABASE INITIALIZATION COMPLETE!")
     print("="*60)
@@ -704,20 +743,13 @@ def init_database():
     print(f"  • SOAR Workflows: {len(soar_workflows)}")
     print(f"  • Compliance Frameworks: {len(compliances)}")
     print(f"  • Attack Vectors: {len(attack_vectors)}")
-    print(f"  • Demo Users: 3")
-    
-    print("\n🔐 Demo Credentials:")
-    print("  Analyst:  analyst / demo (read-only)")
-    print("  Admin:    admin / demo (manage artifacts)")
-    print("  Super:    superadmin / demo (full control)")
-    
+
     print("\n📚 Next Steps:")
     print("  1. Start the application")
-    print("  2. Login with one of the demo credentials")
-    print("  3. Select a framework (MITRE or NIST)")
-    print("  4. Explore the security sources and mappings")
-    print("  5. View correlation rules and detection artifacts")
-    
+    print("  2. Log in with the bootstrap super-admin credentials (SUPER_ADMIN_*)")
+    print("  3. Create admin and analyst users from the Users screen")
+    print("  4. Select a framework (MITRE or NIST) and explore sources/mappings")
+
     print("\n" + "="*60 + "\n")
 
 if __name__ == "__main__":

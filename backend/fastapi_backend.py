@@ -34,7 +34,32 @@ from database_models import (
 # CONFIGURATION
 # ============================================================================
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+import secrets as _secrets
+import logging
+
+logger = logging.getLogger("cybersec.api")
+
+# Deployment environment: "production" (default) enforces strict security.
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production").lower()
+
+# JWT signing key. MUST be provided via the SECRET_KEY env var in production.
+# In non-production we fall back to an ephemeral random key (tokens won't
+# survive a restart, which is fine for local development).
+SECRET_KEY = os.getenv("SECRET_KEY")
+_INSECURE_DEFAULTS = {"", "your-secret-key-change-in-production", "changeme"}
+if not SECRET_KEY or SECRET_KEY in _INSECURE_DEFAULTS:
+    if ENVIRONMENT == "production":
+        raise RuntimeError(
+            "SECRET_KEY environment variable is not set or uses an insecure "
+            "default. Set a strong, unique SECRET_KEY before starting in "
+            "production (e.g. `openssl rand -hex 32`)."
+        )
+    SECRET_KEY = _secrets.token_hex(32)
+    logger.warning(
+        "SECRET_KEY not set; generated an ephemeral development key. "
+        "Tokens will be invalidated on restart. Do NOT use this in production."
+    )
+
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
 
@@ -51,6 +76,23 @@ class UserCreate(BaseModel):
     email: str
     password: str
     role: str = "analyst"
+
+class UserUpdate(BaseModel):
+    email: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    role: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -344,51 +386,179 @@ app.add_middleware(
 # AUTH ENDPOINTS
 # ============================================================================
 
-@app.post("/auth/register", response_model=dict)
-async def register(
-    user: UserCreate,
-    db: Session = Depends(get_db),
-    current_user: Optional[dict] = Depends(get_current_user_optional)
-):
-    """Register new user (only admin can create non-analyst users)"""
-    existing_user = db.query(User).filter(
-        (User.username == user.username) | (User.email == user.email)
-    ).first()
-    if existing_user:
+MIN_PASSWORD_LENGTH = 8
+
+def _validate_password(password: str):
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
         raise HTTPException(
             status_code=400,
-            detail="Username or email already registered"
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters long",
         )
-    
+
+def _assignable_roles(actor_role: str) -> set:
+    """Roles a given actor is allowed to assign to other users."""
+    if actor_role == RoleEnum.SUPER_ADMIN.value:
+        return {RoleEnum.ANALYST.value, RoleEnum.ADMIN.value, RoleEnum.SUPER_ADMIN.value}
+    if actor_role == RoleEnum.ADMIN.value:
+        # Admins manage analysts and other admins, but not super admins.
+        return {RoleEnum.ANALYST.value, RoleEnum.ADMIN.value}
+    return set()
+
+def _can_manage_target(actor_role: str, target_role: str) -> bool:
+    """Whether an actor may modify/delete a user with target_role."""
+    if actor_role == RoleEnum.SUPER_ADMIN.value:
+        return True
+    if actor_role == RoleEnum.ADMIN.value:
+        return target_role != RoleEnum.SUPER_ADMIN.value
+    return False
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_me(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the currently authenticated user's profile."""
+    user = db.query(User).filter(User.id == current_user["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+@app.get("/auth/users", response_model=List[UserResponse])
+async def list_users(
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """List all users (admin+ only)."""
+    return db.query(User).order_by(User.id).all()
+
+@app.post("/auth/users", response_model=UserResponse, status_code=201)
+async def create_user(
+    user: UserCreate,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Create a new user (admin+ only). Role must be one the actor may assign."""
+    _validate_password(user.password)
+
     valid_roles = {r.value for r in RoleEnum}
     if user.role not in valid_roles:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {sorted(valid_roles)}")
 
-    role = RoleEnum.ANALYST.value
-    if current_user:
-        current_role = current_user.get("role")
-        if current_role == RoleEnum.SUPER_ADMIN.value:
-            role = user.role
-        elif current_role == RoleEnum.ADMIN.value and user.role in [RoleEnum.ANALYST.value, RoleEnum.ADMIN.value]:
-            role = user.role
-        
-    hashed_pwd = hash_password(user.password)
+    allowed = _assignable_roles(current_user["role"])
+    if user.role not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You are not permitted to assign the '{user.role}' role.",
+        )
+
+    existing_user = db.query(User).filter(
+        (User.username == user.username) | (User.email == user.email)
+    ).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+
     db_user = User(
         username=user.username,
         email=user.email,
-        password_hash=hashed_pwd,
-        role=role,
-        is_active=True
+        password_hash=hash_password(user.password),
+        role=user.role,
+        is_active=True,
     )
     db.add(db_user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Username or email already registered")
     db.refresh(db_user)
-    
-    return {
-        "message": "User created successfully",
-        "username": db_user.username,
-        "role": db_user.role
-    }
+    return db_user
+
+@app.patch("/auth/users/{user_id}", response_model=UserResponse)
+async def update_user(
+    user_id: int,
+    update: UserUpdate,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Update a user's email, password, role, or active status (admin+ only)."""
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    actor_role = current_user["role"]
+    if not _can_manage_target(actor_role, target.role):
+        raise HTTPException(status_code=403, detail="You are not permitted to manage this user.")
+
+    is_self = target.id == current_user["user_id"]
+
+    if update.role is not None and update.role != target.role:
+        valid_roles = {r.value for r in RoleEnum}
+        if update.role not in valid_roles:
+            raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {sorted(valid_roles)}")
+        if update.role not in _assignable_roles(actor_role):
+            raise HTTPException(status_code=403, detail=f"You are not permitted to assign the '{update.role}' role.")
+        if is_self:
+            raise HTTPException(status_code=400, detail="You cannot change your own role.")
+        # Prevent removing the last active super admin.
+        if target.role == RoleEnum.SUPER_ADMIN.value:
+            _guard_last_super_admin(db, exclude_id=target.id)
+        target.role = update.role
+
+    if update.is_active is not None and update.is_active != target.is_active:
+        if is_self and update.is_active is False:
+            raise HTTPException(status_code=400, detail="You cannot deactivate your own account.")
+        if update.is_active is False and target.role == RoleEnum.SUPER_ADMIN.value:
+            _guard_last_super_admin(db, exclude_id=target.id)
+        target.is_active = update.is_active
+
+    if update.email is not None:
+        target.email = update.email
+
+    if update.password is not None:
+        _validate_password(update.password)
+        target.password_hash = hash_password(update.password)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Email already in use")
+    db.refresh(target)
+    return target
+
+@app.delete("/auth/users/{user_id}")
+async def delete_user(
+    user_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Delete a user (admin+ only). Cannot delete self or the last super admin."""
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == current_user["user_id"]:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    if not _can_manage_target(current_user["role"], target.role):
+        raise HTTPException(status_code=403, detail="You are not permitted to delete this user.")
+    if target.role == RoleEnum.SUPER_ADMIN.value:
+        _guard_last_super_admin(db, exclude_id=target.id)
+
+    db.delete(target)
+    db.commit()
+    return {"message": "User deleted successfully"}
+
+def _guard_last_super_admin(db: Session, exclude_id: int):
+    """Raise if removing/demoting this user would leave no active super admin."""
+    remaining = db.query(User).filter(
+        User.role == RoleEnum.SUPER_ADMIN.value,
+        User.is_active == True,  # noqa: E712
+        User.id != exclude_id,
+    ).count()
+    if remaining == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot remove the last active super admin.",
+        )
 
 @app.post("/auth/login", response_model=TokenResponse)
 async def login(
@@ -825,6 +995,69 @@ async def create_highlight(
     db.add(new_highlight)
     db.commit()
     return {"message": "Highlight created successfully"}
+
+# ============================================================================
+# DELETE ENDPOINTS (Admin required)
+# ============================================================================
+
+@app.delete("/correlation-rules/{rule_id}")
+async def delete_correlation_rule(
+    rule_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Delete a correlation rule and any model mappings (admin+ only)."""
+    rule = db.query(CorrelationRule).filter(CorrelationRule.id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Correlation rule not found")
+    db.query(ModelCorrelationMap).filter(
+        ModelCorrelationMap.correlation_rule_id == rule_id
+    ).delete(synchronize_session=False)
+    db.delete(rule)
+    db.commit()
+    return {"message": "Correlation rule deleted successfully"}
+
+@app.delete("/model-correlation-map/{map_id}")
+async def unmap_correlation_from_model(
+    map_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Remove a correlation-rule-to-model mapping without deleting the rule (admin+ only)."""
+    mapping = db.query(ModelCorrelationMap).filter(ModelCorrelationMap.id == map_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+    db.delete(mapping)
+    db.commit()
+    return {"message": "Mapping removed successfully"}
+
+@app.delete("/soar-flows/{flow_id}")
+async def delete_soar_flow(
+    flow_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Delete a SOAR flow (admin+ only)."""
+    flow = db.query(SOARFlow).filter(SOARFlow.id == flow_id).first()
+    if not flow:
+        raise HTTPException(status_code=404, detail="SOAR flow not found")
+    db.delete(flow)
+    db.commit()
+    return {"message": "SOAR flow deleted successfully"}
+
+@app.delete("/highlights/{highlight_id}")
+async def delete_highlight(
+    highlight_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db),
+):
+    """Delete a highlight (admin+ only)."""
+    highlight = db.query(Highlight).filter(Highlight.id == highlight_id).first()
+    if not highlight:
+        raise HTTPException(status_code=404, detail="Highlight not found")
+    db.delete(highlight)
+    db.commit()
+    return {"message": "Highlight deleted successfully"}
 
 @app.post("/import/correlation-rules/csv")
 async def import_correlation_rules_csv(

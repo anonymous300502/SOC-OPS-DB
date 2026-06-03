@@ -98,8 +98,8 @@ flow = SOARFlow(
 # Login
 POST /auth/login
 {
-    "username": "analyst",
-    "password": "demo"
+    "username": "<username>",
+    "password": "<your-password>"
 }
 # Returns: {access_token, token_type, expires_in}
 
@@ -410,8 +410,8 @@ class APIService {
 ```python
 def test_login_success():
     response = client.post('/auth/login', json={
-        'username': 'analyst',
-        'password': 'demo'
+        'username': '<username>',
+        'password': '<your-password>'
     })
     assert response.status_code == 200
     assert 'access_token' in response.json()
@@ -438,7 +438,7 @@ def test_role_enforcement():
 it('should login with valid credentials', async () => {
     await act(async () => {
         // Simulate login
-        await api.login('analyst', 'demo');
+        await api.login('<username>', '<your-password>');
     });
     expect(localStorage.getItem('auth_token')).toBeTruthy();
 });
