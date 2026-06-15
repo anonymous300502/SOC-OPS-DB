@@ -79,25 +79,51 @@ class Framework(Base):
         Index('idx_framework_name', 'name'),
     )
 
+# Self-referential many-to-many hierarchy for framework vectors. A child can
+# have multiple parents (e.g. a MITRE technique belongs to several tactics), so
+# a simple parent_id column is insufficient — we use an association table.
+vector_links = Table(
+    "vector_links",
+    Base.metadata,
+    Column("parent_id", Integer, ForeignKey("framework_vectors.id", ondelete="CASCADE"), primary_key=True),
+    Column("child_id", Integer, ForeignKey("framework_vectors.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
 class FrameworkVector(Base):
     """
-    Represents tactics (MITRE) or functions (NIST)
+    A node in a framework hierarchy. Depending on ``level`` this is:
+      - MITRE: tactic -> technique -> subtechnique
+      - NIST CSF 2.0: function -> category -> subcategory
+    Hierarchy is expressed via the ``vector_links`` association (DAG-capable).
     """
     __tablename__ = "framework_vectors"
-    
+
     id = Column(Integer, primary_key=True)
     framework_id = Column(Integer, ForeignKey('frameworks.id'), nullable=False)
-    external_id = Column(String(100), nullable=False)  # e.g., "TA0001", "ID.AM"
+    external_id = Column(String(100), nullable=False)  # e.g., "TA0001", "T1055.001", "GV.OC-01"
     name = Column(String(255), nullable=False)
     description = Column(Text)
+    # tactic|technique|subtechnique (MITRE) or function|category|subcategory (NIST)
+    level = Column(String(20))
     created_at = Column(DateTime, default=datetime.utcnow)
-    
+
     framework = relationship("Framework", back_populates="vectors")
     model_mappings = relationship("ModelFrameworkMap", back_populates="framework_vector", cascade="all, delete-orphan")
-    
+
+    # Hierarchy: a node's children and parents within the same framework.
+    children = relationship(
+        "FrameworkVector",
+        secondary=vector_links,
+        primaryjoin=id == vector_links.c.parent_id,
+        secondaryjoin=id == vector_links.c.child_id,
+        backref="parents",
+    )
+
     __table_args__ = (
         UniqueConstraint('framework_id', 'external_id', name='uq_framework_vector'),
         Index('idx_framework_vector_framework', 'framework_id'),
+        Index('idx_framework_vector_level', 'level'),
     )
 
 # ============================================================================

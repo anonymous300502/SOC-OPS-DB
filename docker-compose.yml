@@ -55,7 +55,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+        # Same-origin path proxied by nginx to the backend. Leave as /api
+        # unless the API is served from a separate host.
+        VITE_API_URL: ${VITE_API_URL:-/api}
     container_name: cybersec-ui
     ports:
       - "80:80"

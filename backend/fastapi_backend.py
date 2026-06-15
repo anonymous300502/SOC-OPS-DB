@@ -14,7 +14,7 @@ import jwt
 import bcrypt
 from functools import wraps
 from sqlalchemy.orm import Session, sessionmaker, joinedload
-from sqlalchemy import and_, create_engine
+from sqlalchemy import and_, or_, func, select, create_engine
 from sqlalchemy.exc import IntegrityError
 import os
 import csv
@@ -27,7 +27,7 @@ from database_models import (
     Base, User, Framework, FrameworkVector, SourceType, Brand, SourceModel,
     ModelFrameworkMap, CorrelationRule, ModelCorrelationMap, Parser, SOARFlow,
     Compliance, AttackVector, Highlight, RoleEnum, ParserFormatEnum,
-    init_db
+    vector_links, init_db
 )
 
 # ============================================================================
@@ -234,6 +234,30 @@ class HighlightCreate(BaseModel):
 
 class ImportData(BaseModel):
     items: List[dict]
+
+class SourceTypeCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+class BrandCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+class SourceModelCreate(BaseModel):
+    source_type_id: int
+    brand_id: int
+    name: str
+    description: Optional[str] = None
+
+class SourceModelUpdate(BaseModel):
+    source_type_id: Optional[int] = None
+    brand_id: Optional[int] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+class FrameworkVectorMapCreate(BaseModel):
+    """Attach a source model to one or more framework vectors (TTPs)."""
+    vector_ids: List[int]
 
 class ComplianceUpdate(BaseModel):
     name: Optional[str] = None
@@ -600,68 +624,48 @@ async def get_frameworks(
     frameworks = db.query(Framework).all()
     return [{"id": f.id, "name": f.name, "description": f.description} for f in frameworks]
 
-@app.get("/frameworks/{framework}/vectors")
-async def get_framework_vectors(
-    framework: str,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    GET /frameworks/{framework}/vectors
-    Returns all tactics/functions for a framework
-    """
-    if framework not in ["mitre", "nist"]:
-        raise HTTPException(status_code=400, detail="Invalid framework")
-    
-    fw = db.query(Framework).filter(Framework.name == framework).first()
-    if not fw:
-        raise HTTPException(status_code=404, detail="Framework not found")
-    
-    vectors = db.query(FrameworkVector).filter(FrameworkVector.framework_id == fw.id).all()
+def _serialize_vectors(db: Session, vectors: list) -> list:
+    """Serialize vectors with child and mapped-model counts (batched)."""
+    if not vectors:
+        return []
+    ids = [v.id for v in vectors]
+    child_counts = dict(
+        db.query(vector_links.c.parent_id, func.count(vector_links.c.child_id))
+        .filter(vector_links.c.parent_id.in_(ids))
+        .group_by(vector_links.c.parent_id)
+        .all()
+    )
+    model_counts = dict(
+        db.query(ModelFrameworkMap.framework_vector_id, func.count(ModelFrameworkMap.id))
+        .filter(ModelFrameworkMap.framework_vector_id.in_(ids))
+        .group_by(ModelFrameworkMap.framework_vector_id)
+        .all()
+    )
     return [
         {
             "id": v.id,
             "external_id": v.external_id,
             "name": v.name,
-            "description": v.description
+            "description": v.description,
+            "level": v.level,
+            "child_count": child_counts.get(v.id, 0),
+            "model_count": model_counts.get(v.id, 0),
         }
         for v in vectors
     ]
 
-@app.get("/frameworks/{framework}/vectors/{vector}/models")
-async def get_models_for_vector(
-    framework: str,
-    vector: int,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    GET /frameworks/{framework}/vectors/{vector}/models
-    Returns all source models mapped to this vector, grouped by source_type → brand → model
-    """
-    if framework not in ["mitre", "nist"]:
-        raise HTTPException(status_code=400, detail="Invalid framework")
-    
-    fw = db.query(Framework).filter(Framework.name == framework).first()
-    if not fw:
-        raise HTTPException(status_code=404, detail="Framework not found")
-        
-    vec = db.query(FrameworkVector).filter(
-        and_(FrameworkVector.framework_id == fw.id, FrameworkVector.id == vector)
-    ).first()
-    if not vec:
-        raise HTTPException(status_code=404, detail="Vector not found")
-        
+
+def _mapped_models(db: Session, vector_id: int) -> list:
+    """Source models mapped directly to a vector."""
     mappings = (
         db.query(ModelFrameworkMap)
         .options(
             joinedload(ModelFrameworkMap.source_model).joinedload(SourceModel.source_type),
             joinedload(ModelFrameworkMap.source_model).joinedload(SourceModel.brand),
         )
-        .filter(ModelFrameworkMap.framework_vector_id == vec.id)
+        .filter(ModelFrameworkMap.framework_vector_id == vector_id)
         .all()
     )
-
     result = []
     for m in mappings:
         model = m.source_model
@@ -670,9 +674,115 @@ async def get_models_for_vector(
                 "source_type": model.source_type.name if model.source_type else "Unknown",
                 "brand": model.brand.name if model.brand else "Unknown",
                 "model": model.name,
-                "model_id": model.id
+                "model_id": model.id,
             })
     return result
+
+
+@app.get("/frameworks/{framework}/vectors")
+async def get_framework_vectors(
+    framework: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns the TOP-LEVEL nodes of a framework (MITRE tactics / NIST functions).
+    Use GET /vectors/{id} to drill down into children.
+    """
+    if framework not in ["mitre", "nist"]:
+        raise HTTPException(status_code=400, detail="Invalid framework")
+
+    fw = db.query(Framework).filter(Framework.name == framework).first()
+    if not fw:
+        raise HTTPException(status_code=404, detail="Framework not found")
+
+    # Top-level = vectors of this framework that are nobody's child.
+    child_subq = select(vector_links.c.child_id)
+    vectors = (
+        db.query(FrameworkVector)
+        .filter(FrameworkVector.framework_id == fw.id, ~FrameworkVector.id.in_(child_subq))
+        .order_by(FrameworkVector.external_id)
+        .all()
+    )
+    return _serialize_vectors(db, vectors)
+
+
+@app.get("/frameworks/{framework}/vectors/search")
+async def search_framework_vectors(
+    framework: str,
+    q: str = "",
+    level: Optional[str] = None,
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Search a framework's vectors by external_id or name (for mapping UI)."""
+    if framework not in ["mitre", "nist"]:
+        raise HTTPException(status_code=400, detail="Invalid framework")
+    fw = db.query(Framework).filter(Framework.name == framework).first()
+    if not fw:
+        raise HTTPException(status_code=404, detail="Framework not found")
+
+    query = db.query(FrameworkVector).filter(FrameworkVector.framework_id == fw.id)
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.filter(or_(
+            FrameworkVector.external_id.ilike(like),
+            FrameworkVector.name.ilike(like),
+        ))
+    if level:
+        query = query.filter(FrameworkVector.level == level)
+    vectors = query.order_by(FrameworkVector.external_id).limit(min(limit, 200)).all()
+    return _serialize_vectors(db, vectors)
+
+
+@app.get("/vectors/{vector_id}")
+async def get_vector(
+    vector_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """A single vector node with its children (next drill-down level) and the
+    source models mapped directly to it."""
+    v = db.query(FrameworkVector).filter(FrameworkVector.id == vector_id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vector not found")
+    children = sorted(v.children, key=lambda c: c.external_id)
+    return {
+        "id": v.id,
+        "external_id": v.external_id,
+        "name": v.name,
+        "description": v.description,
+        "level": v.level,
+        "framework": v.framework.name if v.framework else None,
+        "parents": [
+            {"id": p.id, "external_id": p.external_id, "name": p.name, "level": p.level}
+            for p in sorted(v.parents, key=lambda p: p.external_id)
+        ],
+        "children": _serialize_vectors(db, children),
+        "models": _mapped_models(db, v.id),
+    }
+
+
+@app.get("/frameworks/{framework}/vectors/{vector}/models")
+async def get_models_for_vector(
+    framework: str,
+    vector: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Source models mapped to this vector (kept for backward compatibility)."""
+    if framework not in ["mitre", "nist"]:
+        raise HTTPException(status_code=400, detail="Invalid framework")
+    fw = db.query(Framework).filter(Framework.name == framework).first()
+    if not fw:
+        raise HTTPException(status_code=404, detail="Framework not found")
+    vec = db.query(FrameworkVector).filter(
+        and_(FrameworkVector.framework_id == fw.id, FrameworkVector.id == vector)
+    ).first()
+    if not vec:
+        raise HTTPException(status_code=404, detail="Vector not found")
+    return _mapped_models(db, vec.id)
 
 # ============================================================================
 # MODEL DETAIL ENDPOINTS
@@ -697,6 +807,9 @@ async def get_model_details(
             joinedload(SourceModel.parsers),
             joinedload(SourceModel.soar_flows),
             joinedload(SourceModel.highlights),
+            joinedload(SourceModel.framework_mappings)
+            .joinedload(ModelFrameworkMap.framework_vector)
+            .joinedload(FrameworkVector.framework),
         )
         .filter(SourceModel.id == model_id)
         .first()
@@ -765,8 +878,290 @@ async def get_model_details(
         "highlights": [
             {"id": h.id, "title": h.title, "content": h.content, "priority": h.priority}
             for h in highlights
-        ]
+        ],
+        "framework_vectors": [
+            {
+                "map_id": fm.id,
+                "id": fm.framework_vector.id,
+                "external_id": fm.framework_vector.external_id,
+                "name": fm.framework_vector.name,
+                "level": fm.framework_vector.level,
+                "framework": fm.framework_vector.framework.name if fm.framework_vector.framework else None,
+            }
+            for fm in model.framework_mappings if fm.framework_vector
+        ],
     }
+
+# ============================================================================
+# SOURCE CATALOG CRUD (Admin required for writes)
+# ============================================================================
+
+@app.get("/source-types")
+async def list_source_types(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    rows = db.query(SourceType).order_by(SourceType.name).all()
+    return [{"id": s.id, "name": s.name, "description": s.description} for s in rows]
+
+@app.post("/source-types", status_code=201)
+async def create_source_type(
+    payload: SourceTypeCreate,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    existing = db.query(SourceType).filter(SourceType.name == name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Source type already exists")
+    st = SourceType(name=name, description=payload.description)
+    db.add(st)
+    db.commit()
+    db.refresh(st)
+    return {"id": st.id, "name": st.name, "description": st.description}
+
+@app.delete("/source-types/{type_id}")
+async def delete_source_type(
+    type_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    st = db.query(SourceType).filter(SourceType.id == type_id).first()
+    if not st:
+        raise HTTPException(status_code=404, detail="Source type not found")
+    if db.query(SourceModel).filter(SourceModel.source_type_id == type_id).count():
+        raise HTTPException(status_code=400, detail="Cannot delete: source models still use this type")
+    db.delete(st)
+    db.commit()
+    return {"message": "Source type deleted"}
+
+@app.get("/brands")
+async def list_brands(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    rows = db.query(Brand).order_by(Brand.name).all()
+    return [{"id": b.id, "name": b.name, "description": b.description} for b in rows]
+
+@app.post("/brands", status_code=201)
+async def create_brand(
+    payload: BrandCreate,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if db.query(Brand).filter(Brand.name == name).first():
+        raise HTTPException(status_code=400, detail="Brand already exists")
+    b = Brand(name=name, description=payload.description)
+    db.add(b)
+    db.commit()
+    db.refresh(b)
+    return {"id": b.id, "name": b.name, "description": b.description}
+
+@app.delete("/brands/{brand_id}")
+async def delete_brand(
+    brand_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    b = db.query(Brand).filter(Brand.id == brand_id).first()
+    if not b:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    if db.query(SourceModel).filter(SourceModel.brand_id == brand_id).count():
+        raise HTTPException(status_code=400, detail="Cannot delete: source models still use this brand")
+    db.delete(b)
+    db.commit()
+    return {"message": "Brand deleted"}
+
+@app.get("/source-models")
+async def list_source_models(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    rows = (
+        db.query(SourceModel)
+        .options(joinedload(SourceModel.source_type), joinedload(SourceModel.brand))
+        .order_by(SourceModel.name)
+        .all()
+    )
+    # mapped-vector counts per model (batched)
+    map_counts = dict(
+        db.query(ModelFrameworkMap.source_model_id, func.count(ModelFrameworkMap.id))
+        .group_by(ModelFrameworkMap.source_model_id)
+        .all()
+    )
+    return [
+        {
+            "id": m.id,
+            "name": m.name,
+            "description": m.description,
+            "source_type_id": m.source_type_id,
+            "brand_id": m.brand_id,
+            "source_type": m.source_type.name if m.source_type else None,
+            "brand": m.brand.name if m.brand else None,
+            "mapped_vectors": map_counts.get(m.id, 0),
+        }
+        for m in rows
+    ]
+
+@app.post("/source-models", status_code=201)
+async def create_source_model(
+    payload: SourceModelCreate,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not db.query(SourceType).filter(SourceType.id == payload.source_type_id).first():
+        raise HTTPException(status_code=404, detail="Source type not found")
+    if not db.query(Brand).filter(Brand.id == payload.brand_id).first():
+        raise HTTPException(status_code=404, detail="Brand not found")
+    sm = SourceModel(
+        source_type_id=payload.source_type_id,
+        brand_id=payload.brand_id,
+        name=name,
+        description=payload.description,
+    )
+    db.add(sm)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A model with this type/brand/name already exists")
+    db.refresh(sm)
+    return {"id": sm.id, "name": sm.name, "description": sm.description,
+            "source_type_id": sm.source_type_id, "brand_id": sm.brand_id}
+
+@app.patch("/source-models/{model_id}")
+async def update_source_model(
+    model_id: int,
+    payload: SourceModelUpdate,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    sm = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    if not sm:
+        raise HTTPException(status_code=404, detail="Model not found")
+    data = payload.model_dump(exclude_unset=True)
+    if "name" in data and data["name"] is not None:
+        data["name"] = data["name"].strip()
+    for field, value in data.items():
+        setattr(sm, field, value)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A model with this type/brand/name already exists")
+    db.refresh(sm)
+    return {"id": sm.id, "name": sm.name, "description": sm.description,
+            "source_type_id": sm.source_type_id, "brand_id": sm.brand_id}
+
+@app.delete("/source-models/{model_id}")
+async def delete_source_model(
+    model_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    sm = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    if not sm:
+        raise HTTPException(status_code=404, detail="Model not found")
+    db.delete(sm)  # cascades remove parsers/soar/mappings per model relationships
+    db.commit()
+    return {"message": "Source model deleted"}
+
+# ============================================================================
+# MODEL ↔ FRAMEWORK VECTOR (TTP) MAPPING (Admin required for writes)
+# ============================================================================
+
+@app.get("/models/{model_id}/framework-vectors")
+async def get_model_framework_vectors(
+    model_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List the framework vectors (TTPs) a model is mapped to, grouped by framework."""
+    model = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+    mappings = (
+        db.query(ModelFrameworkMap)
+        .options(joinedload(ModelFrameworkMap.framework_vector).joinedload(FrameworkVector.framework))
+        .filter(ModelFrameworkMap.source_model_id == model_id)
+        .all()
+    )
+    out = []
+    for m in mappings:
+        v = m.framework_vector
+        if not v:
+            continue
+        out.append({
+            "map_id": m.id,
+            "vector_id": v.id,
+            "external_id": v.external_id,
+            "name": v.name,
+            "level": v.level,
+            "framework": v.framework.name if v.framework else None,
+        })
+    return out
+
+@app.post("/models/{model_id}/framework-vectors", status_code=201)
+async def map_model_framework_vectors(
+    model_id: int,
+    payload: FrameworkVectorMapCreate,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    """Map a model to one or more framework vectors (TTPs). Idempotent: existing
+    mappings are skipped. Vectors may belong to either framework."""
+    model = db.query(SourceModel).filter(SourceModel.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    requested = set(payload.vector_ids)
+    if not requested:
+        return {"added": 0, "skipped": 0}
+    valid_ids = {
+        vid for (vid,) in db.query(FrameworkVector.id).filter(FrameworkVector.id.in_(requested)).all()
+    }
+    missing = requested - valid_ids
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Unknown vector id(s): {sorted(missing)}")
+
+    existing = {
+        vid for (vid,) in db.query(ModelFrameworkMap.framework_vector_id)
+        .filter(ModelFrameworkMap.source_model_id == model_id,
+                ModelFrameworkMap.framework_vector_id.in_(valid_ids)).all()
+    }
+    added = 0
+    for vid in valid_ids:
+        if vid in existing:
+            continue
+        db.add(ModelFrameworkMap(source_model_id=model_id, framework_vector_id=vid))
+        added += 1
+    db.commit()
+    return {"added": added, "skipped": len(valid_ids) - added}
+
+@app.delete("/models/{model_id}/framework-vectors/{vector_id}")
+async def unmap_model_framework_vector(
+    model_id: int,
+    vector_id: int,
+    current_user: dict = Depends(require_role("admin", "super_admin")),
+    db: Session = Depends(get_db)
+):
+    mapping = db.query(ModelFrameworkMap).filter(
+        ModelFrameworkMap.source_model_id == model_id,
+        ModelFrameworkMap.framework_vector_id == vector_id,
+    ).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+    db.delete(mapping)
+    db.commit()
+    return {"message": "Mapping removed"}
 
 # ============================================================================
 # PARSER ENDPOINTS (Admin required)
@@ -1062,6 +1457,7 @@ async def delete_highlight(
 @app.post("/import/correlation-rules/csv")
 async def import_correlation_rules_csv(
     file: UploadFile = File(...),
+    model_id: Optional[int] = None,
     current_user: dict = Depends(require_role("admin", "super_admin")),
     db: Session = Depends(get_db)
 ):
@@ -1071,7 +1467,13 @@ async def import_correlation_rules_csv(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File must be a .csv or .txt file"
         )
-    
+
+    # When a model is supplied, imported rules are also mapped to it so they
+    # appear in that model's detail view. Validate it up front.
+    if model_id is not None:
+        if not db.query(SourceModel).filter(SourceModel.id == model_id).first():
+            raise HTTPException(status_code=404, detail="Model not found")
+
     def _strip(val):
         """Strip surrounding quotes from a CSV field parsed with QUOTE_NONE."""
         if val is None:
@@ -1085,11 +1487,13 @@ async def import_correlation_rules_csv(
     failed_rows = []
 
     try:
+        # NOTE: no escapechar — the source `rule_builder`/`Rule` fields contain
+        # raw JSON with backslashes (e.g. Windows paths "C:\\Windows\\"). Using
+        # a backslash escapechar would corrupt that JSON and make it unparseable.
         reader = csv.DictReader(
             codecs.iterdecode(file.file, "utf-8"),
             delimiter="|",
             quoting=csv.QUOTE_NONE,
-            escapechar="\\",
         )
         line_num = 1
         for row in reader:
@@ -1099,21 +1503,25 @@ async def import_correlation_rules_csv(
             severity = _strip(row.get("Severity"))
             created_by = _strip(row.get("Created By"))
             rule_builder_str = _strip(row.get("rule_builder"))
+            rule_expr = _strip(row.get("Rule"))
             tactics = _strip(row.get("tactics", ""))
+            technique = _strip(row.get("technique", ""))
 
             if not rule_name:
                 failed_rows.append({"line": line_num, "reason": "Missing required field: Rule Name"})
                 continue
 
-            if rule_builder_str:
-                try:
-                    rule_logic = json.loads(rule_builder_str)
-                except Exception:
-                    rule_logic = {"raw_query": rule_builder_str}
-            else:
-                rule_logic = {"raw_query": ""}
+            # Store the human-readable rule expression exactly as it appears in
+            # the source `Rule` column. The source wraps literal values in
+            # "^&@#^" markers (e.g. ^&@#^4688^&@#^); render those as spaces so
+            # the stored/displayed rule looks like the sample, e.g.
+            #   {( eventid =  4688  ) and ( process_name !~  C:\Windows\System32\  ... ) }
+            rule_logic = (rule_expr or rule_builder_str or "").replace("^&@#^", " ")
 
+            # Combine MITRE tactic and technique identifiers into tags.
             tags = [t.strip() for t in tactics.split(",") if t.strip()] if tactics else []
+            if technique:
+                tags += [t.strip() for t in technique.split(",") if t.strip()]
             sev = severity.lower() if severity else "medium"
 
             try:
@@ -1127,6 +1535,12 @@ async def import_correlation_rules_csv(
                         tags=tags,
                     )
                     db.add(rule)
+                    db.flush()
+                    if model_id is not None:
+                        db.add(ModelCorrelationMap(
+                            source_model_id=model_id,
+                            correlation_rule_id=rule.id,
+                        ))
                 successful_inserts += 1
             except IntegrityError as e:
                 failed_rows.append({"line": line_num, "reason": f"Duplicate entry: {str(e.orig)}"})
@@ -1140,7 +1554,7 @@ async def import_correlation_rules_csv(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to parse CSV file: {str(e)}",
         )
-        
+
     return {
         "successful_inserts": successful_inserts,
         "failed_rows": failed_rows
@@ -1165,19 +1579,21 @@ async def export_correlation_rules_csv(
     writer.writerow(headers)
     
     for r in rules:
-        rule_builder_str = ""
-        if r.rule_logic:
-            if isinstance(r.rule_logic, (dict, list)):
-                rule_builder_str = json.dumps(r.rule_logic)
-            else:
-                rule_builder_str = str(r.rule_logic)
-                
+        # rule_logic holds the human-readable rule expression. Older records may
+        # still hold structured JSON; serialize those for the rule_builder column.
+        if isinstance(r.rule_logic, (dict, list)):
+            rule_expr = ""
+            rule_builder_str = json.dumps(r.rule_logic)
+        else:
+            rule_expr = str(r.rule_logic) if r.rule_logic else ""
+            rule_builder_str = ""
+
         tactics_str = ",".join(r.tags) if isinstance(r.tags, list) else ""
-        
+
         row = [
             r.id,
             r.name or "",
-            r.description or "",
+            rule_expr,
             r.description or "",
             (r.severity or "medium").capitalize(),
             "0",

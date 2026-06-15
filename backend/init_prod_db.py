@@ -5,6 +5,7 @@ Run this ONCE to populate database with MITRE, NIST, sources, and mappings
 
 import os
 import sys
+import json
 import bcrypt
 from datetime import datetime
 from sqlalchemy import create_engine
@@ -15,10 +16,60 @@ sys.path.insert(0, os.path.dirname(__file__))
 from database_models import (
     Base, User, Framework, FrameworkVector, SourceType, Brand, SourceModel,
     ModelFrameworkMap, CorrelationRule, ModelCorrelationMap, Parser, SOARFlow,
-    Compliance, AttackVector, Highlight, RoleEnum
+    Compliance, AttackVector, Highlight, RoleEnum, vector_links
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///cybersec_dashboard.db")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+
+def load_framework_tree(db, framework, filename):
+    """Load a {nodes, links} framework hierarchy JSON into framework_vectors and
+    the vector_links association. Returns the number of nodes inserted."""
+    path = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(path):
+        print(f"  ⚠️  {filename} not found in {DATA_DIR}; skipping {framework.name} hierarchy.")
+        return 0
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    objs = {}
+    for n in data.get("nodes", []):
+        v = FrameworkVector(
+            framework_id=framework.id,
+            external_id=n["external_id"],
+            name=n["name"],
+            description=(n.get("description") or None),
+            level=n.get("level"),
+        )
+        db.add(v)
+        objs[n["external_id"]] = v
+    db.flush()
+
+    link_rows = []
+    for pair in data.get("links", []):
+        parent_ext, child_ext = pair[0], pair[1]
+        p, c = objs.get(parent_ext), objs.get(child_ext)
+        if p is not None and c is not None:
+            link_rows.append({"parent_id": p.id, "child_id": c.id})
+    if link_rows:
+        db.execute(vector_links.insert(), link_rows)
+    db.flush()
+    print(f"  ✓ {framework.name}: {len(objs)} nodes, {len(link_rows)} hierarchy links")
+    return len(objs)
+
+
+def map_model_to_vectors(db, model, framework, external_ids):
+    """Map a source model to framework vectors by external_id (skips unknowns)."""
+    for ext in external_ids:
+        v = (
+            db.query(FrameworkVector)
+            .filter(FrameworkVector.framework_id == framework.id,
+                    FrameworkVector.external_id == ext)
+            .first()
+        )
+        if v:
+            db.add(ModelFrameworkMap(source_model_id=model.id, framework_vector_id=v.id))
 
 # Minimum length enforced for the bootstrap super-admin password.
 MIN_PASSWORD_LENGTH = 8
@@ -111,7 +162,8 @@ def init_database():
         return
 
     print("🧹 Clearing existing catalog data...")
-    # Clear existing data
+    # Clear existing data (vector_links first — association rows reference vectors)
+    db.execute(vector_links.delete())
     db.query(ModelFrameworkMap).delete()
     db.query(ModelCorrelationMap).delete()
     db.query(CorrelationRule).delete()
@@ -134,91 +186,20 @@ def init_database():
     # FRAMEWORKS
     # ========================================================================
     
-    mitre = Framework(name="mitre", description="MITRE ATT&CK Framework - Adversary Tactics and Techniques")
-    nist = Framework(name="nist", description="NIST Cybersecurity Framework - Govern, Manage, Protect")
+    mitre = Framework(name="mitre", description="MITRE ATT&CK Enterprise - Adversary Tactics, Techniques & Sub-techniques")
+    nist = Framework(name="nist", description="NIST Cybersecurity Framework 2.0 - Functions, Categories & Subcategories")
     db.add_all([mitre, nist])
     db.flush()
-    
+
     # ========================================================================
-    # MITRE ATT&CK TACTICS
+    # FRAMEWORK HIERARCHIES (loaded from bundled reference data)
     # ========================================================================
-    
-    print("🎯 Adding MITRE ATT&CK tactics...")
-    
-    mitre_tactics = [
-        ("TA0001", "Initial Access", "The adversary is trying to get into your network."),
-        ("TA0002", "Execution", "The adversary is trying to run malicious code."),
-        ("TA0003", "Persistence", "The adversary is trying to stay in your network."),
-        ("TA0004", "Privilege Escalation", "The adversary is trying to gain higher-level permissions."),
-        ("TA0005", "Defense Evasion", "The adversary is trying to avoid being detected."),
-        ("TA0006", "Credential Access", "The adversary is trying to steal account names and passwords."),
-        ("TA0007", "Discovery", "The adversary is trying to figure out your environment."),
-        ("TA0008", "Lateral Movement", "The adversary is trying to move through your network."),
-        ("TA0009", "Collection", "The adversary is trying to gather data of interest."),
-        ("TA0010", "Exfiltration", "The adversary is trying to steal data."),
-        ("TA0011", "Command and Control", "The adversary is trying to communicate with compromised systems."),
-        ("TA0040", "Impact", "The adversary is trying to manipulate, interrupt, or destroy your systems."),
-        ("TA0043", "Reconnaissance", "The adversary is trying to gather information they can use to plan future operations."),
-        ("TA0042", "Resource Development", "The adversary is trying to establish resources they can use to support operations."),
-    ]
-    
-    mitre_vectors = []
-    for ext_id, name, desc in mitre_tactics:
-        v = FrameworkVector(
-            framework_id=mitre.id,
-            external_id=ext_id,
-            name=name,
-            description=desc
-        )
-        mitre_vectors.append(v)
-        db.add(v)
+
+    print("🎯 Loading framework hierarchies (MITRE ATT&CK / NIST CSF 2.0)...")
+    load_framework_tree(db, mitre, "mitre_enterprise.json")
+    load_framework_tree(db, nist, "nist_csf2.json")
     db.flush()
-    
-    # ========================================================================
-    # NIST FUNCTIONS
-    # ========================================================================
-    
-    print("📋 Adding NIST Cybersecurity Framework functions...")
-    
-    nist_functions = [
-        ("ID.AM", "Asset Management", "Organizational assets are inventoried and classified."),
-        ("ID.BE", "Business Environment", "The organization's mission, objectives, and stakeholders are established."),
-        ("ID.GV", "Governance", "Policies, procedures, and processes to manage the organization."),
-        ("ID.RA", "Risk Assessment", "The organization understands the cybersecurity risk to operations."),
-        ("ID.RM", "Risk Management Strategy", "The organization addresses identified cybersecurity risks."),
-        ("ID.SC", "Supply Chain Risk Management", "The organization manages cybersecurity risks in supply chain."),
-        ("ID.IR", "Incident Response Planning", "Procedures are in place to handle incidents."),
-        ("PR.AC", "Access Control", "Access to physical and cyber assets is limited to authorized users."),
-        ("PR.AT", "Awareness and Training", "The organization provides cybersecurity awareness and training."),
-        ("PR.DS", "Data Security", "Information and records are managed per data classification scheme."),
-        ("PR.IP", "Information Protection Processes", "Processes are maintained to ensure delivery of information."),
-        ("PR.MA", "Maintenance", "Maintenance and repairs are performed on assets."),
-        ("PR.PT", "Protective Technology", "Technical security solutions protect against attacks."),
-        ("DE.AE", "Anomalies and Events", "Anomalies and events are detected and analyzed."),
-        ("DE.CM", "Security Continuous Monitoring", "The information system and assets are continuously monitored."),
-        ("DE.DP", "Detection Processes", "Detection processes and procedures are maintained and tested."),
-        ("RS.RP", "Response Planning", "Response processes and procedures are executed and maintained."),
-        ("RS.CO", "Communications", "Response activities are coordinated with internal and external stakeholders."),
-        ("RS.AN", "Analysis", "Analysis is conducted to ensure effective response and support recovery activities."),
-        ("RS.MI", "Mitigation", "Activities are performed to prevent expansion of an event."),
-        ("RS.IM", "Improvements", "Organizational response activities are improved by incorporating lessons learned."),
-        ("RC.RP", "Recovery Planning", "Incident recovery plans are established and tested."),
-        ("RC.IM", "Improvements", "Recovery procedures are updated and improvements are implemented."),
-        ("RC.CO", "Communications", "Restoration activities and progress are communicated."),
-    ]
-    
-    nist_vectors = []
-    for ext_id, name, desc in nist_functions:
-        v = FrameworkVector(
-            framework_id=nist.id,
-            external_id=ext_id,
-            name=name,
-            description=desc
-        )
-        nist_vectors.append(v)
-        db.add(v)
-    db.flush()
-    
+
     # ========================================================================
     # SOURCE TYPES
     # ========================================================================
@@ -312,62 +293,30 @@ def init_database():
     # FRAMEWORK MAPPINGS (source_model ↔ framework_vector)
     # ========================================================================
     
-    print("🔗 Mapping sources to MITRE tactics...")
-    
-    # Windows Server 2022 maps to multiple MITRE tactics
+    print("🔗 Mapping sample sources to MITRE techniques (TTPs)...")
+
     windows_model = model_objects["Microsoft:Windows Server 2022"]
-    for idx in [0, 2, 3, 4, 5, 8, 10]:  # Initial Access, Persistence, PrivEsc, DefEvasion, CredAccess, Collection, C&C
-        mapping = ModelFrameworkMap(
-            source_model_id=windows_model.id,
-            framework_vector_id=mitre_vectors[idx].id
-        )
-        db.add(mapping)
-    
-    # PA-5220 maps to firewall-relevant tactics
     pa_model = model_objects["Palo Alto:PA-5220"]
-    for idx in [0, 4, 5, 9, 10]:  # Initial Access, DefEvasion, CredAccess, Exfiltration, C&C
-        mapping = ModelFrameworkMap(
-            source_model_id=pa_model.id,
-            framework_vector_id=mitre_vectors[idx].id
-        )
-        db.add(mapping)
-    
-    # CrowdStrike Falcon maps to detection tactics
     falcon_model = model_objects["CrowdStrike:Falcon"]
-    for idx in [1, 3, 4, 6, 7, 8, 9]:  # Execution, PrivEsc, DefEvasion, Discovery, LateralMovement, Collection, Exfiltration
-        mapping = ModelFrameworkMap(
-            source_model_id=falcon_model.id,
-            framework_vector_id=mitre_vectors[idx].id
-        )
-        db.add(mapping)
-    
-    # Splunk maps to detection/monitoring
     splunk_model = model_objects["Splunk:Universal Forwarder"]
-    for idx in [5, 8, 9, 10]:  # CredAccess, Collection, Exfiltration, C&C
-        mapping = ModelFrameworkMap(
-            source_model_id=splunk_model.id,
-            framework_vector_id=mitre_vectors[idx].id
-        )
-        db.add(mapping)
-    
-    print("🔗 Mapping sources to NIST functions...")
-    
-    # Windows maps to NIST
-    for idx in [0, 7, 8, 9, 13, 14]:  # Asset Management, Access Control, Awareness, Data Security, Anomalies, Monitoring
-        mapping = ModelFrameworkMap(
-            source_model_id=windows_model.id,
-            framework_vector_id=nist_vectors[idx].id
-        )
-        db.add(mapping)
-    
-    # PA-5220 maps to NIST
-    for idx in [7, 12, 13, 14, 15]:  # Access Control, Protective Tech, Anomalies, Monitoring, Detection
-        mapping = ModelFrameworkMap(
-            source_model_id=pa_model.id,
-            framework_vector_id=nist_vectors[idx].id
-        )
-        db.add(mapping)
-    
+
+    # Map to real ATT&CK techniques / sub-techniques (skipped silently if a
+    # given id is absent from the loaded dataset).
+    map_model_to_vectors(db, windows_model, mitre,
+                         ["T1078", "T1055", "T1059.001", "T1053.005", "T1547.001", "TA0005"])
+    map_model_to_vectors(db, pa_model, mitre,
+                         ["T1071", "T1090", "T1048", "T1041", "TA0011"])
+    map_model_to_vectors(db, falcon_model, mitre,
+                         ["T1055", "T1059", "T1486", "T1003", "TA0002"])
+    map_model_to_vectors(db, splunk_model, mitre,
+                         ["T1078", "T1110", "T1098"])
+
+    print("🔗 Mapping sample sources to NIST CSF 2.0 subcategories...")
+    # Common CSF 2.0 subcategory ids; skipped if NIST data not loaded.
+    map_model_to_vectors(db, windows_model, nist, ["ID.AM-01", "PR.AA-01", "DE.CM-01"])
+    map_model_to_vectors(db, pa_model, nist, ["PR.IR-01", "DE.CM-01", "DE.AE-02"])
+    map_model_to_vectors(db, falcon_model, nist, ["DE.CM-01", "RS.MA-01"])
+
     db.flush()
     
     # ========================================================================
@@ -726,15 +675,18 @@ def init_database():
     # ========================================================================
     ensure_super_admin(db)
 
+    mitre_nodes = db.query(FrameworkVector).filter(FrameworkVector.framework_id == mitre.id).count()
+    nist_nodes = db.query(FrameworkVector).filter(FrameworkVector.framework_id == nist.id).count()
+
     db.close()
 
     print("\n" + "="*60)
     print("✅ DATABASE INITIALIZATION COMPLETE!")
     print("="*60)
     print("\n📊 Data Summary:")
-    print(f"  • Frameworks: 2 (MITRE ATT&CK, NIST)")
-    print(f"  • MITRE Tactics: {len(mitre_tactics)}")
-    print(f"  • NIST Functions: {len(nist_functions)}")
+    print(f"  • Frameworks: 2 (MITRE ATT&CK Enterprise, NIST CSF 2.0)")
+    print(f"  • MITRE vectors (tactics/techniques/sub-techniques): {mitre_nodes}")
+    print(f"  • NIST vectors (functions/categories/subcategories): {nist_nodes}")
     print(f"  • Source Types: {len(source_types)}")
     print(f"  • Brands: {len(brands_data)}")
     print(f"  • Source Models: {len(models_data)}")

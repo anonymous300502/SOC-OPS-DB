@@ -8,7 +8,11 @@ import SoarFlowViewer from './src/components/SoarFlowViewer';
 // API SERVICE LAYER
 // ============================================================================
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// Default to a same-origin path so the browser talks to nginx (port 80/443),
+// which proxies /api/* to the backend over the internal network. This avoids
+// CORS and does not depend on the backend port being published to the host.
+// Override with VITE_API_URL only for split deployments (e.g. a separate API host).
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 class APIService {
   constructor() {
@@ -84,6 +88,68 @@ class APIService {
     return await response.json();
   }
 
+  // -- Framework hierarchy drill-down --
+  async getVector(vectorId) {
+    const response = await this.request(`${API_BASE}/vectors/${vectorId}`, {
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to fetch vector');
+    return await response.json();
+  }
+
+  async searchVectors(framework, q, level) {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (level) params.set('level', level);
+    const response = await this.request(
+      `${API_BASE}/frameworks/${framework}/vectors/search?${params.toString()}`,
+      { headers: this.getHeaders() }
+    );
+    if (!response.ok) throw new Error('Failed to search vectors');
+    return await response.json();
+  }
+
+  // -- Source catalog CRUD --
+  async getSourceTypes() { return this._get('/source-types', 'source types'); }
+  async getBrands() { return this._get('/brands', 'brands'); }
+  async getSourceModels() { return this._get('/source-models', 'source models'); }
+
+  async createSourceType(data) { return this._post('/source-types', data, 'source type'); }
+  async createBrand(data) { return this._post('/brands', data, 'brand'); }
+  async createSourceModel(data) { return this._post('/source-models', data, 'source model'); }
+
+  deleteSourceType(id) { return this._delete(`/source-types/${id}`, 'source type'); }
+  deleteBrand(id) { return this._delete(`/brands/${id}`, 'brand'); }
+  deleteSourceModel(id) { return this._delete(`/source-models/${id}`, 'source model'); }
+
+  // -- Model <-> framework vector (TTP) mapping --
+  async getModelVectors(modelId) { return this._get(`/models/${modelId}/framework-vectors`, 'mappings'); }
+  async mapModelVectors(modelId, vectorIds) {
+    return this._post(`/models/${modelId}/framework-vectors`, { vector_ids: vectorIds }, 'mapping');
+  }
+  unmapModelVector(modelId, vectorId) {
+    return this._delete(`/models/${modelId}/framework-vectors/${vectorId}`, 'mapping');
+  }
+
+  async _get(path, label) {
+    const response = await this.request(`${API_BASE}${path}`, { headers: this.getHeaders() });
+    if (!response.ok) throw new Error(`Failed to fetch ${label}`);
+    return await response.json();
+  }
+
+  async _post(path, body, label) {
+    const response = await this.request(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || `Failed to create ${label}`);
+    }
+    return await response.json();
+  }
+
   async createParser(modelId, parser) {
     const response = await this.request(`${API_BASE}/parsers?model_id=${modelId}`, {
       method: 'POST',
@@ -128,10 +194,12 @@ class APIService {
     return await response.json();
   }
 
-  async importCorrelationRulesCSV(file) {
+  async importCorrelationRulesCSV(modelId, file) {
     const formData = new FormData();
     formData.append('file', file);
-    const response = await this.request(`${API_BASE}/import/correlation-rules/csv`, {
+    let url = `${API_BASE}/import/correlation-rules/csv`;
+    if (modelId) url += `?model_id=${modelId}`;
+    const response = await this.request(url, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${this.token}`,
@@ -431,167 +499,222 @@ function FrameworkSelector({ onSelectFramework }) {
   );
 }
 
-// VECTOR LIST
-function VectorList({ framework, onSelectVector, onBack }) {
-  const [vectors, setVectors] = useState([]);
-  const [loading, setLoading] = useState(true);
+// VECTOR EXPLORER (recursive drill-down through the framework hierarchy)
+function levelLabel(level, plural = true) {
+  const map = {
+    tactic: 'Tactic', technique: 'Technique', subtechnique: 'Sub-technique',
+    function: 'Function', category: 'Category', subcategory: 'Subcategory',
+  };
+  const base = map[level] || 'Item';
+  return plural ? `${base}s` : base;
+}
 
-  useEffect(() => {
-    const fetchVectors = async () => {
-      try {
-        const data = await api.getFrameworkVectors(framework);
-        setVectors(data);
-      } catch (err) {
-        console.error('Failed to fetch vectors:', err);
-      }
-      setLoading(false);
-    };
-    fetchVectors();
-  }, [framework]);
-
-  if (loading) {
-    return <div className="text-center py-8 text-gray-400">Loading vectors...</div>;
-  }
-
+function VectorCard({ vec, onOpen }) {
   return (
-    <div>
-      <button
-        onClick={onBack}
-        className="mb-6 text-blue-400 hover:text-blue-300 flex items-center gap-2"
-      >
-        <ChevronRight className="w-4 h-4 rotate-180" />
-        Back to Frameworks
-      </button>
-
-      <h2 className="text-2xl font-bold text-white mb-6 capitalize">
-        {framework} Framework - Tactics/Functions
-      </h2>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {vectors.map((vector) => (
-          <button
-            key={vector.id}
-            onClick={() => onSelectVector(vector.id, vector.name)}
-            className="p-4 bg-slate-700/50 border border-slate-600 rounded hover:border-blue-500 hover:bg-slate-700 transition text-left"
-          >
-            <div className="flex items-start justify-between">
-              <div>
-                <div className="text-blue-400 text-sm font-mono mb-1">
-                  {vector.external_id}
-                </div>
-                <h3 className="text-lg font-semibold text-white mb-2">
-                  {vector.name}
-                </h3>
-                <p className="text-gray-400 text-sm">{vector.description}</p>
-              </div>
-              <ChevronRight className="w-5 h-5 text-gray-400 mt-1 flex-shrink-0" />
-            </div>
-          </button>
-        ))}
+    <button
+      onClick={() => onOpen(vec)}
+      className="p-4 bg-slate-700/50 border border-slate-600 rounded hover:border-blue-500 hover:bg-slate-700 transition text-left w-full"
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-blue-400 text-xs font-mono mb-1">{vec.external_id}</div>
+          <h3 className="text-base font-semibold text-white">{vec.name}</h3>
+          {vec.description && (
+            <p className="text-gray-400 text-xs mt-1 line-clamp-2">{vec.description}</p>
+          )}
+          <div className="flex flex-wrap gap-2 mt-2">
+            {vec.level && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-600/60 text-slate-300 capitalize">
+                {vec.level}
+              </span>
+            )}
+            {vec.child_count > 0 && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300">
+                {vec.child_count} {levelLabel(vec.level === 'tactic' ? 'technique' : vec.level === 'technique' ? 'subtechnique' : vec.level === 'function' ? 'category' : 'subcategory').toLowerCase()}
+              </span>
+            )}
+            {vec.model_count > 0 && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
+                {vec.model_count} source{vec.model_count > 1 ? 's' : ''}
+              </span>
+            )}
+          </div>
+        </div>
+        <ChevronRight className="w-5 h-5 text-gray-400 mt-1 flex-shrink-0" />
       </div>
-    </div>
+    </button>
   );
 }
 
-// MODEL LISTING (grouped by source type → brand → model)
-function ModelListing({ framework, vectorId, vectorName, onSelectModel, onBack }) {
-  const [models, setModels] = useState([]);
+function VectorExplorer({ framework, onSelectModel, onBack }) {
+  const [stack, setStack] = useState([]); // breadcrumb of opened vectors
+  const [topVectors, setTopVectors] = useState(null);
+  const [node, setNode] = useState(null); // current node detail (when stack non-empty)
   const [loading, setLoading] = useState(true);
-  const [filterBrand, setFilterBrand] = useState('all');
+  const [search, setSearch] = useState('');
+  const [searchResults, setSearchResults] = useState(null);
 
-  useEffect(() => {
-    const fetchModels = async () => {
-      try {
-        const data = await api.getModelsForVector(framework, vectorId);
-        setModels(data);
-      } catch (err) {
-        console.error('Failed to fetch models:', err);
-      }
-      setLoading(false);
-    };
-    fetchModels();
-  }, [framework, vectorId]);
-
-  if (loading) {
-    return <div className="text-center py-8 text-gray-400">Loading models...</div>;
-  }
-
-  // Group models by source type → brand
-  const grouped = models.reduce((acc, model) => {
-    if (!acc[model.source_type]) acc[model.source_type] = {};
-    if (!acc[model.source_type][model.brand]) {
-      acc[model.source_type][model.brand] = [];
+  const loadTop = useCallback(async () => {
+    setLoading(true);
+    setStack([]);
+    setNode(null);
+    setSearchResults(null);
+    try {
+      setTopVectors(await api.getFrameworkVectors(framework));
+    } catch (err) {
+      console.error('Failed to load framework vectors:', err);
     }
-    acc[model.source_type][model.brand].push(model);
-    return acc;
-  }, {});
+    setLoading(false);
+  }, [framework]);
 
-  const brands = Array.from(new Set(models.map((m) => m.brand)));
+  useEffect(() => { loadTop(); }, [loadTop]);
+
+  const openVector = async (vec) => {
+    setLoading(true);
+    try {
+      const detail = await api.getVector(vec.id);
+      setNode(detail);
+      setStack((prev) => {
+        const idx = prev.findIndex((s) => s.id === vec.id);
+        if (idx >= 0) return prev.slice(0, idx + 1);
+        return [...prev, { id: vec.id, external_id: vec.external_id, name: vec.name, level: vec.level }];
+      });
+      setSearchResults(null);
+    } catch (err) {
+      console.error('Failed to open vector:', err);
+    }
+    setLoading(false);
+  };
+
+  const doSearch = async (e) => {
+    e.preventDefault();
+    const q = search.trim();
+    if (!q) { setSearchResults(null); return; }
+    setLoading(true);
+    try {
+      setSearchResults(await api.searchVectors(framework, q));
+    } catch (err) {
+      console.error('Search failed:', err);
+    }
+    setLoading(false);
+  };
+
+  const children = node ? node.children : topVectors || [];
 
   return (
     <div>
-      <button
-        onClick={onBack}
-        className="mb-6 text-blue-400 hover:text-blue-300 flex items-center gap-2"
-      >
-        <ChevronRight className="w-4 h-4 rotate-180" />
-        Back to Vectors
+      <button onClick={onBack} className="mb-4 text-blue-400 hover:text-blue-300 flex items-center gap-2">
+        <ChevronRight className="w-4 h-4 rotate-180" /> Back to Frameworks
       </button>
 
-      <div className="mb-6">
-        <h2 className="text-2xl font-bold text-white mb-2">
-          {vectorName}
-        </h2>
-        <p className="text-gray-400">Source Models Mapped to This Vector</p>
-      </div>
-
-      <div className="mb-6">
-        <label className="text-sm text-gray-300 mr-4">Filter by Brand:</label>
-        <select
-          value={filterBrand}
-          onChange={(e) => setFilterBrand(e.target.value)}
-          className="px-3 py-1 bg-slate-700 border border-slate-600 rounded text-white text-sm"
-        >
-          <option value="all">All Brands</option>
-          {brands.map((brand) => (
-            <option key={brand} value={brand}>
-              {brand}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div className="space-y-8">
-        {Object.entries(grouped).map(([sourceType, brands_dict]) => (
-          <div key={sourceType}>
-            <h3 className="text-lg font-bold text-blue-400 mb-4 uppercase">
-              {sourceType}
-            </h3>
-            <div className="space-y-4">
-              {Object.entries(brands_dict).map(([brand, modelList]) => {
-                if (filterBrand !== 'all' && brand !== filterBrand) return null;
-                return (
-                  <div key={brand} className="pl-4 border-l-2 border-slate-600">
-                    <h4 className="text-white font-semibold mb-3">{brand}</h4>
-                    <div className="space-y-2">
-                      {modelList.map((model) => (
-                        <button
-                          key={model.model_id}
-                          onClick={() => onSelectModel(model.model_id, model.model)}
-                          className="w-full text-left p-3 bg-slate-700/50 border border-slate-600 rounded hover:border-blue-500 hover:bg-slate-700 transition flex items-center justify-between"
-                        >
-                          <span className="text-gray-200">{model.model}</span>
-                          <Eye className="w-4 h-4 text-gray-400" />
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+      {/* Breadcrumb */}
+      <div className="flex flex-wrap items-center gap-1 mb-4 text-sm">
+        <button onClick={loadTop} className="text-blue-400 hover:text-blue-300 font-semibold uppercase">
+          {framework}
+        </button>
+        {stack.map((s, i) => (
+          <span key={s.id} className="flex items-center gap-1">
+            <ChevronRight className="w-3 h-3 text-gray-500" />
+            <button
+              onClick={() => (i === stack.length - 1 ? null : openVector(s))}
+              className={i === stack.length - 1 ? 'text-white font-mono' : 'text-blue-400 hover:text-blue-300 font-mono'}
+            >
+              {s.external_id}
+            </button>
+          </span>
         ))}
       </div>
+
+      {/* Search */}
+      <form onSubmit={doSearch} className="mb-6 flex gap-2">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder={`Search ${framework.toUpperCase()} (e.g. T1059, PowerShell, DE.CM)`}
+          className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+        />
+        <button type="submit" className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm">
+          Search
+        </button>
+        {searchResults && (
+          <button type="button" onClick={() => { setSearch(''); setSearchResults(null); }}
+            className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm">
+            Clear
+          </button>
+        )}
+      </form>
+
+      {loading ? (
+        <div className="text-center py-8 text-gray-400">Loading…</div>
+      ) : searchResults ? (
+        <div>
+          <h2 className="text-lg font-bold text-white mb-3">
+            {searchResults.length} result{searchResults.length !== 1 ? 's' : ''} for “{search}”
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {searchResults.map((v) => <VectorCard key={v.id} vec={v} onOpen={openVector} />)}
+            {searchResults.length === 0 && <p className="text-gray-400 text-sm">No matches.</p>}
+          </div>
+        </div>
+      ) : (
+        <div>
+          {node && (
+            <div className="mb-6">
+              <div className="text-blue-400 text-sm font-mono">{node.external_id}</div>
+              <h2 className="text-2xl font-bold text-white">{node.name}</h2>
+              {node.description && <p className="text-gray-400 mt-2 text-sm max-w-3xl">{node.description}</p>}
+              {node.parents && node.parents.length > 1 && (
+                <p className="text-xs text-gray-500 mt-2">
+                  Also appears under: {node.parents.map((p) => p.external_id).join(', ')}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Mapped source models at this node */}
+          {node && node.models && node.models.length > 0 && (
+            <div className="mb-8">
+              <h3 className="text-lg font-bold text-emerald-400 mb-3">
+                Mapped Sources ({node.models.length})
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {node.models.map((m) => (
+                  <button
+                    key={m.model_id}
+                    onClick={() => onSelectModel(m.model_id, m.model)}
+                    className="w-full text-left p-3 bg-emerald-900/10 border border-emerald-700/40 rounded hover:border-emerald-500 hover:bg-emerald-900/20 transition flex items-center justify-between"
+                  >
+                    <span className="text-gray-200 text-sm">
+                      <span className="text-gray-400">{m.source_type} · {m.brand}</span> — {m.model}
+                    </span>
+                    <Eye className="w-4 h-4 text-gray-400" />
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Child vectors (drill deeper) */}
+          {children.length > 0 ? (
+            <div>
+              {node && (
+                <h3 className="text-lg font-bold text-blue-400 mb-3">
+                  {children[0] ? levelLabel(children[0].level) : 'Children'} ({children.length})
+                </h3>
+              )}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {children.map((v) => <VectorCard key={v.id} vec={v} onOpen={openVector} />)}
+              </div>
+            </div>
+          ) : (
+            node && (!node.models || node.models.length === 0) && (
+              <p className="text-gray-400 text-sm">
+                This is a leaf {levelLabel(node.level, false).toLowerCase()} with no mapped sources yet.
+              </p>
+            )
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -710,7 +833,7 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
     const file = event.target.files[0];
     if (!file) return;
     try {
-      const res = await api.importCorrelationRulesCSV(file);
+      const res = await api.importCorrelationRulesCSV(modelId, file);
       const { successful_inserts, failed_rows } = res;
       const failedCount = failed_rows?.length || 0;
       
@@ -913,6 +1036,40 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                 <div className="text-sm text-gray-400">SOAR Flows</div>
               </div>
             </div>
+
+            {/* Mapped framework TTPs */}
+            <div className="mt-8">
+              <h3 className="text-lg font-bold text-white mb-3">Mapped Framework TTPs</h3>
+              {details.framework_vectors && details.framework_vectors.length > 0 ? (
+                ['mitre', 'nist'].map((fw) => {
+                  const items = details.framework_vectors.filter((v) => v.framework === fw);
+                  if (!items.length) return null;
+                  return (
+                    <div key={fw} className="mb-3">
+                      <div className="text-xs uppercase tracking-wide text-gray-400 mb-2">
+                        {fw === 'mitre' ? 'MITRE ATT&CK' : 'NIST CSF 2.0'} ({items.length})
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {items.map((v) => (
+                          <span
+                            key={v.map_id}
+                            title={v.name}
+                            className={`text-xs px-2 py-1 rounded ${fw === 'mitre' ? 'bg-red-500/15 text-red-200' : 'bg-indigo-500/15 text-indigo-200'}`}
+                          >
+                            <span className="font-mono">{v.external_id}</span>
+                            <span className="text-gray-400 ml-1.5 capitalize">{v.level}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <p className="text-gray-400 text-sm">
+                  No TTPs mapped. {canEdit ? 'Use “Manage Sources” to map this model to MITRE/NIST TTPs.' : ''}
+                </p>
+              )}
+            </div>
           </div>
         )}
 
@@ -991,6 +1148,15 @@ function ModelDetail({ modelId, modelName, onBack, userRole }) {
                       ? rule.rule_logic
                       : JSON.stringify(rule.rule_logic, null, 2)}
                   </div>
+                  {Array.isArray(rule.tags) && rule.tags.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mb-2">
+                      {rule.tags.map((tag, ti) => (
+                        <span key={ti} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-600/60 text-slate-300 font-mono">
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                   <div className="text-xs text-gray-500">
                     By {rule.author} • {new Date(rule.created_at).toLocaleDateString()}
                   </div>
@@ -1269,17 +1435,26 @@ function CreateParserForm({ modelId, onClose, onSuccess }) {
     name: '',
     format: 'json',
     description: '',
-    parser_config: {},
   });
+  const [configText, setConfigText] = useState('{\n  \n}');
+  const [error, setError] = useState('');
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    setError('');
+    let parser_config;
     try {
-      await api.createParser(modelId, formData);
+      parser_config = configText.trim() ? JSON.parse(configText) : {};
+    } catch (err) {
+      setError('Parser config must be valid JSON.');
+      return;
+    }
+    try {
+      await api.createParser(modelId, { ...formData, parser_config });
       onClose();
       if (onSuccess) onSuccess();
     } catch (err) {
-      console.error('Failed to create parser:', err);
+      setError(err.message || 'Failed to create parser');
     }
   };
 
@@ -1298,7 +1473,7 @@ function CreateParserForm({ modelId, onClose, onSuccess }) {
         onChange={(e) => setFormData({ ...formData, format: e.target.value })}
         className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2"
       >
-        {['kv', 'json', 'grok', 'csv', 'cef', 'xml'].map((fmt) => (
+        {['kv', 'json', 'grok', 'csv', 'cef', 'xml', 'syslog_grok'].map((fmt) => (
           <option key={fmt} value={fmt}>
             {fmt.toUpperCase()}
           </option>
@@ -1308,8 +1483,18 @@ function CreateParserForm({ modelId, onClose, onSuccess }) {
         placeholder="Description"
         value={formData.description}
         onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-        className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2 h-20"
+        className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2 h-16"
       />
+      <label className="block text-xs text-gray-300 mb-1">Parser Config (JSON)</label>
+      <textarea
+        value={configText}
+        onChange={(e) => setConfigText(e.target.value)}
+        className="w-full px-3 py-2 bg-slate-800 border border-slate-500 rounded text-white mb-2 h-28 font-mono text-xs"
+        spellCheck={false}
+      />
+      {error && (
+        <div className="mb-2 text-red-300 text-xs bg-red-500/10 border border-red-500/40 rounded px-2 py-1">{error}</div>
+      )}
       <button
         type="submit"
         className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm"
@@ -1326,19 +1511,31 @@ function CreateRuleForm({ modelId, onClose, onSuccess }) {
     name: '',
     rule_logic: '',
     description: '',
-    author: '',
     severity: 'medium',
-    tags: [],
   });
+  const [tagsText, setTagsText] = useState('');
+  const [error, setError] = useState('');
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    setError('');
+    // Accept either a JSON object or a plain expression string for rule_logic.
+    let rule_logic = formData.rule_logic;
+    const trimmed = formData.rule_logic.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        rule_logic = JSON.parse(trimmed);
+      } catch {
+        rule_logic = formData.rule_logic; // keep as raw expression
+      }
+    }
+    const tags = tagsText.split(',').map((t) => t.trim()).filter(Boolean);
     try {
-      await api.createCorrelationRule(modelId, formData);
+      await api.createCorrelationRule(modelId, { ...formData, rule_logic, tags });
       onClose();
       if (onSuccess) onSuccess();
     } catch (err) {
-      console.error('Failed to create rule:', err);
+      setError(err.message || 'Failed to create rule');
     }
   };
 
@@ -1351,6 +1548,12 @@ function CreateRuleForm({ modelId, onClose, onSuccess }) {
         onChange={(e) => setFormData({ ...formData, name: e.target.value })}
         className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2"
         required
+      />
+      <textarea
+        placeholder="Description (optional)"
+        value={formData.description}
+        onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+        className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2 h-16"
       />
       <select
         value={formData.severity}
@@ -1367,9 +1570,19 @@ function CreateRuleForm({ modelId, onClose, onSuccess }) {
         placeholder="Rule Logic (JSON or expression)"
         value={formData.rule_logic}
         onChange={(e) => setFormData({ ...formData, rule_logic: e.target.value })}
-        className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2 h-20"
+        className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2 h-20 font-mono text-xs"
         required
       />
+      <input
+        type="text"
+        placeholder="Tags (comma-separated, e.g. TA0001, T1078)"
+        value={tagsText}
+        onChange={(e) => setTagsText(e.target.value)}
+        className="w-full px-3 py-2 bg-slate-600 border border-slate-500 rounded text-white mb-2 text-sm"
+      />
+      {error && (
+        <div className="mb-2 text-red-300 text-xs bg-red-500/10 border border-red-500/40 rounded px-2 py-1">{error}</div>
+      )}
       <button
         type="submit"
         className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm"
@@ -1377,6 +1590,307 @@ function CreateRuleForm({ modelId, onClose, onSuccess }) {
         Create Rule
       </button>
     </form>
+  );
+}
+
+// ============================================================================
+// SOURCE MANAGEMENT (admin / super_admin) — types, brands, models + TTP mapping
+// ============================================================================
+
+function SourceManagement() {
+  const [types, setTypes] = useState([]);
+  const [brands, setBrands] = useState([]);
+  const [models, setModels] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [mappingModel, setMappingModel] = useState(null);
+
+  const [typeForm, setTypeForm] = useState({ name: '', description: '' });
+  const [brandForm, setBrandForm] = useState({ name: '', description: '' });
+  const [modelForm, setModelForm] = useState({ source_type_id: '', brand_id: '', name: '', description: '' });
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [t, b, m] = await Promise.all([api.getSourceTypes(), api.getBrands(), api.getSourceModels()]);
+      setTypes(t); setBrands(b); setModels(m);
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const flash = (msg) => { setNotice(msg); setError(''); setTimeout(() => setNotice(''), 4000); };
+  const fail = (msg) => { setError(msg); };
+
+  const submitType = async (e) => {
+    e.preventDefault();
+    try { await api.createSourceType(typeForm); setTypeForm({ name: '', description: '' }); flash('Source type created.'); await load(); }
+    catch (err) { fail(err.message); }
+  };
+  const submitBrand = async (e) => {
+    e.preventDefault();
+    try { await api.createBrand(brandForm); setBrandForm({ name: '', description: '' }); flash('Brand created.'); await load(); }
+    catch (err) { fail(err.message); }
+  };
+  const submitModel = async (e) => {
+    e.preventDefault();
+    if (!modelForm.source_type_id || !modelForm.brand_id) { fail('Pick a source type and brand.'); return; }
+    try {
+      await api.createSourceModel({
+        ...modelForm,
+        source_type_id: Number(modelForm.source_type_id),
+        brand_id: Number(modelForm.brand_id),
+      });
+      setModelForm({ source_type_id: '', brand_id: '', name: '', description: '' });
+      flash('Source model created.');
+      await load();
+    } catch (err) { fail(err.message); }
+  };
+
+  const del = async (kind, fn, id, name) => {
+    if (!window.confirm(`Delete ${kind} "${name}"? This cannot be undone.`)) return;
+    try { await fn(id); flash(`${kind} deleted.`); await load(); }
+    catch (err) { fail(err.message); }
+  };
+
+  return (
+    <div>
+      <h2 className="text-2xl font-bold text-white mb-6">Manage Sources</h2>
+      {error && <div className="mb-4 bg-red-500/10 border border-red-500/50 text-red-300 px-4 py-2 rounded text-sm">{error}</div>}
+      {notice && <div className="mb-4 bg-green-500/10 border border-green-500/50 text-green-300 px-4 py-2 rounded text-sm">{notice}</div>}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+        {/* Source Types */}
+        <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-5">
+          <h3 className="text-lg font-semibold text-white mb-3">Source Types</h3>
+          <form onSubmit={submitType} className="flex gap-2 mb-3">
+            <input value={typeForm.name} onChange={(e) => setTypeForm({ ...typeForm, name: e.target.value })}
+              placeholder="e.g. WAF" required className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm" />
+            <input value={typeForm.description} onChange={(e) => setTypeForm({ ...typeForm, description: e.target.value })}
+              placeholder="description" className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm" />
+            <button className="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white text-sm flex items-center gap-1"><Plus className="w-4 h-4" /></button>
+          </form>
+          <div className="flex flex-wrap gap-2">
+            {types.map((t) => (
+              <span key={t.id} className="flex items-center gap-1 text-xs bg-slate-700 px-2 py-1 rounded text-gray-200">
+                {t.name}
+                <button onClick={() => del('source type', api.deleteSourceType.bind(api), t.id, t.name)} className="text-red-400 hover:text-red-300"><Trash2 className="w-3 h-3" /></button>
+              </span>
+            ))}
+          </div>
+        </div>
+
+        {/* Brands */}
+        <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-5">
+          <h3 className="text-lg font-semibold text-white mb-3">Brands</h3>
+          <form onSubmit={submitBrand} className="flex gap-2 mb-3">
+            <input value={brandForm.name} onChange={(e) => setBrandForm({ ...brandForm, name: e.target.value })}
+              placeholder="e.g. Imperva" required className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm" />
+            <input value={brandForm.description} onChange={(e) => setBrandForm({ ...brandForm, description: e.target.value })}
+              placeholder="description" className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm" />
+            <button className="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white text-sm flex items-center gap-1"><Plus className="w-4 h-4" /></button>
+          </form>
+          <div className="flex flex-wrap gap-2">
+            {brands.map((b) => (
+              <span key={b.id} className="flex items-center gap-1 text-xs bg-slate-700 px-2 py-1 rounded text-gray-200">
+                {b.name}
+                <button onClick={() => del('brand', api.deleteBrand.bind(api), b.id, b.name)} className="text-red-400 hover:text-red-300"><Trash2 className="w-3 h-3" /></button>
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Create model */}
+      <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-5 mb-8">
+        <h3 className="text-lg font-semibold text-white mb-3 flex items-center gap-2"><Plus className="w-5 h-5 text-blue-400" /> Add Source Model</h3>
+        <form onSubmit={submitModel} className="grid grid-cols-1 md:grid-cols-5 gap-3">
+          <select value={modelForm.source_type_id} onChange={(e) => setModelForm({ ...modelForm, source_type_id: e.target.value })}
+            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm">
+            <option value="">Source Type…</option>
+            {types.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+          <select value={modelForm.brand_id} onChange={(e) => setModelForm({ ...modelForm, brand_id: e.target.value })}
+            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm">
+            <option value="">Brand…</option>
+            {brands.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+          </select>
+          <input value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })}
+            placeholder="Model name" required className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm" />
+          <input value={modelForm.description} onChange={(e) => setModelForm({ ...modelForm, description: e.target.value })}
+            placeholder="description" className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm" />
+          <button className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded text-sm">Create</button>
+        </form>
+      </div>
+
+      {/* Models list */}
+      <div className="bg-slate-800/50 border border-slate-700 rounded-lg overflow-hidden">
+        <div className="px-5 py-3 border-b border-slate-700 text-white font-semibold">Source Models ({models.length})</div>
+        {loading ? (
+          <p className="text-gray-400 p-6">Loading…</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-slate-700/50 text-gray-300">
+              <tr>
+                <th className="text-left px-4 py-3">Model</th>
+                <th className="text-left px-4 py-3">Type</th>
+                <th className="text-left px-4 py-3">Brand</th>
+                <th className="text-left px-4 py-3">Mapped TTPs</th>
+                <th className="text-right px-4 py-3">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {models.map((m) => (
+                <tr key={m.id} className="border-t border-slate-700 text-gray-200">
+                  <td className="px-4 py-3 font-medium">{m.name}</td>
+                  <td className="px-4 py-3 text-gray-400">{m.source_type}</td>
+                  <td className="px-4 py-3 text-gray-400">{m.brand}</td>
+                  <td className="px-4 py-3">
+                    <span className={m.mapped_vectors ? 'text-blue-300' : 'text-gray-500'}>{m.mapped_vectors}</span>
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center justify-end gap-2">
+                      <button onClick={() => setMappingModel(m)}
+                        className="px-3 py-1 bg-blue-600/80 hover:bg-blue-600 rounded text-xs transition">Map TTPs</button>
+                      <button onClick={() => del('source model', api.deleteSourceModel.bind(api), m.id, m.name)}
+                        className="px-3 py-1 bg-red-600/80 hover:bg-red-600 rounded text-xs transition flex items-center gap-1"><Trash2 className="w-3 h-3" /> Delete</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {models.length === 0 && (
+                <tr><td colSpan={5} className="px-4 py-6 text-gray-400 text-center">No source models yet. Add one above.</td></tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {mappingModel && (
+        <VectorMappingModal
+          model={mappingModel}
+          onClose={() => setMappingModel(null)}
+          onChanged={load}
+        />
+      )}
+    </div>
+  );
+}
+
+// Modal: search MITRE / NIST and map one or many TTPs to a source model.
+function VectorMappingModal({ model, onClose, onChanged }) {
+  const [current, setCurrent] = useState([]);
+  const [framework, setFramework] = useState('mitre');
+  const [q, setQ] = useState('');
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const loadCurrent = useCallback(async () => {
+    try { setCurrent(await api.getModelVectors(model.id)); }
+    catch (err) { setError(err.message); }
+    setLoading(false);
+  }, [model.id]);
+
+  useEffect(() => { loadCurrent(); }, [loadCurrent]);
+
+  const search = async (e) => {
+    e.preventDefault();
+    setError('');
+    try { setResults(await api.searchVectors(framework, q.trim())); }
+    catch (err) { setError(err.message); }
+  };
+
+  const mappedIds = new Set(current.map((c) => c.vector_id));
+
+  const add = async (vec) => {
+    setBusy(true); setError('');
+    try { await api.mapModelVectors(model.id, [vec.id]); await loadCurrent(); onChanged && onChanged(); }
+    catch (err) { setError(err.message); }
+    setBusy(false);
+  };
+  const remove = async (vectorId) => {
+    setBusy(true); setError('');
+    try { await api.unmapModelVector(model.id, vectorId); await loadCurrent(); onChanged && onChanged(); }
+    catch (err) { setError(err.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-slate-900 border border-slate-700 rounded-lg w-full max-w-3xl max-h-[85vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-slate-700 flex items-center justify-between">
+          <div>
+            <div className="text-white font-semibold">Map TTPs — {model.name}</div>
+            <div className="text-xs text-gray-400">{model.source_type} · {model.brand}</div>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-white font-mono">✕</button>
+        </div>
+
+        <div className="p-5 overflow-y-auto">
+          {error && <div className="mb-3 bg-red-500/10 border border-red-500/50 text-red-300 px-3 py-2 rounded text-xs">{error}</div>}
+
+          {/* Current mappings */}
+          <div className="mb-4">
+            <div className="text-xs uppercase tracking-wide text-gray-500 mb-2">Currently mapped ({current.length})</div>
+            {loading ? <p className="text-gray-400 text-sm">Loading…</p> : current.length === 0 ? (
+              <p className="text-gray-500 text-sm italic">No TTPs mapped yet.</p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {current.map((c) => (
+                  <span key={c.map_id} className={`flex items-center gap-1 text-xs px-2 py-1 rounded ${c.framework === 'mitre' ? 'bg-red-500/15 text-red-200' : 'bg-indigo-500/15 text-indigo-200'}`}>
+                    <span className="font-mono">{c.external_id}</span>
+                    <span className="text-gray-400 hidden sm:inline">{c.name?.slice(0, 28)}</span>
+                    <button disabled={busy} onClick={() => remove(c.vector_id)} className="text-red-300 hover:text-red-100 ml-1">✕</button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Search & add */}
+          <div className="border-t border-slate-700 pt-4">
+            <div className="text-xs uppercase tracking-wide text-gray-500 mb-2">Add TTPs</div>
+            <form onSubmit={search} className="flex gap-2 mb-3">
+              <select value={framework} onChange={(e) => { setFramework(e.target.value); setResults([]); }}
+                className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm">
+                <option value="mitre">MITRE</option>
+                <option value="nist">NIST</option>
+              </select>
+              <input value={q} onChange={(e) => setQ(e.target.value)}
+                placeholder={framework === 'mitre' ? 'e.g. T1059, PowerShell, TA0005' : 'e.g. DE.CM, detect'}
+                className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm" />
+              <button className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm">Search</button>
+            </form>
+            <div className="space-y-1 max-h-64 overflow-y-auto">
+              {results.map((v) => {
+                const isMapped = mappedIds.has(v.id);
+                return (
+                  <div key={v.id} className="flex items-center justify-between gap-2 p-2 bg-slate-800 rounded">
+                    <div className="min-w-0">
+                      <span className="font-mono text-blue-300 text-xs">{v.external_id}</span>
+                      <span className="text-gray-300 text-sm ml-2">{v.name}</span>
+                      <span className="text-[10px] text-gray-500 ml-2 capitalize">{v.level}</span>
+                    </div>
+                    <button disabled={busy || isMapped} onClick={() => add(v)}
+                      className={`px-2 py-1 rounded text-xs flex-shrink-0 ${isMapped ? 'bg-slate-700 text-gray-500 cursor-default' : 'bg-emerald-600 hover:bg-emerald-700 text-white'}`}>
+                      {isMapped ? 'Mapped' : 'Add'}
+                    </button>
+                  </div>
+                );
+              })}
+              {results.length === 0 && <p className="text-gray-500 text-xs">Search to find TTPs to map.</p>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1629,10 +2143,18 @@ export default function App() {
           <div className="flex items-center gap-4">
             <button
               onClick={() => setCurrentPage('frameworks')}
-              className={`px-3 py-2 rounded text-sm transition ${currentPage !== 'users' ? 'text-blue-400 font-semibold' : 'text-gray-300 hover:text-white'}`}
+              className={`px-3 py-2 rounded text-sm transition ${!['users', 'sources'].includes(currentPage) ? 'text-blue-400 font-semibold' : 'text-gray-300 hover:text-white'}`}
             >
               Dashboard
             </button>
+            {isAdmin && (
+              <button
+                onClick={() => setCurrentPage('sources')}
+                className={`px-3 py-2 rounded text-sm transition ${currentPage === 'sources' ? 'text-blue-400 font-semibold' : 'text-gray-300 hover:text-white'}`}
+              >
+                Manage Sources
+              </button>
+            )}
             {isAdmin && (
               <button
                 onClick={() => setCurrentPage('users')}
@@ -1661,22 +2183,26 @@ export default function App() {
           <UserManagement userRole={userRole} currentUsername={username} />
         )}
 
+        {currentPage === 'sources' && isAdmin && (
+          <SourceManagement />
+        )}
+
         {currentPage === 'frameworks' && (
           <FrameworkSelector
             onSelectFramework={(fw) => {
               setSelectedFramework(fw);
-              setCurrentPage('vectors');
+              setCurrentPage('explore');
             }}
           />
         )}
 
-        {currentPage === 'vectors' && selectedFramework && (
-          <VectorList
+        {currentPage === 'explore' && selectedFramework && (
+          <VectorExplorer
             framework={selectedFramework}
-            onSelectVector={(id, name) => {
-              setSelectedVector(id);
-              setSelectedVectorName(name);
-              setCurrentPage('models');
+            onSelectModel={(id, name) => {
+              setSelectedModel(id);
+              setSelectedModelName(name);
+              setCurrentPage('detail');
             }}
             onBack={() => {
               setCurrentPage('frameworks');
@@ -1685,26 +2211,12 @@ export default function App() {
           />
         )}
 
-        {currentPage === 'models' && selectedFramework && selectedVector && (
-          <ModelListing
-            framework={selectedFramework}
-            vectorId={selectedVector}
-            vectorName={selectedVectorName}
-            onSelectModel={(id, name) => {
-              setSelectedModel(id);
-              setSelectedModelName(name);
-              setCurrentPage('detail');
-            }}
-            onBack={() => setCurrentPage('vectors')}
-          />
-        )}
-
         {currentPage === 'detail' && selectedModel && (
           <ModelDetail
             modelId={selectedModel}
             modelName={selectedModelName}
             userRole={userRole}
-            onBack={() => setCurrentPage('models')}
+            onBack={() => setCurrentPage('explore')}
           />
         )}
       </main>
