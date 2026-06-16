@@ -21,3 +21,8 @@ env/
 
 # Claude Code harness data
 .claude/
+
+# Air-gap build artifacts (large image archives & extracted bundles)
+*.tar
+*.tar.gz
+socdb-airgap-*/
